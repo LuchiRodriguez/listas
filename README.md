@@ -1,3 +1,61 @@
-﻿# Listas
+# Listas
 
-Lista de súper y tareas compartida, en vivo.
+Lista de súper y de tareas compartida entre dos personas, en vivo desde el móvil. App web estática (HTML + CSS + JS vanilla, sin build) con Supabase como backend (Postgres, Auth y Realtime). Se publica en GitHub Pages, en un subpath, por eso todas las rutas son relativas. Se puede agregar a la pantalla de inicio (PWA, sin service worker).
+
+## Estructura
+
+- `index.html`, `style.css`, `app.js`: la app. Sin scripts ni estilos inline (la CSP los bloquea).
+- `config.js`: URL y clave publicable de Supabase.
+- `vendor/supabase.js`: supabase-js 2.118.0 (UMD).
+- `manifest.webmanifest`, `icons/`: PWA.
+- `supabase/schema.sql`: tablas, RLS, privilegios por columna, triggers y realtime.
+- `supabase/test_rls.sql`: pruebas de las políticas.
+
+## Configurar Supabase
+
+1. Creá un proyecto en Supabase.
+2. En el SQL editor, corré `supabase/schema.sql` entero (y después `supabase/test_rls.sql` para comprobar las políticas).
+3. En `config.js` reemplazá los dos placeholders:
+   - `__SUPABASE_HOST__` por el host del proyecto, por ejemplo `abcd.supabase.co` (sin `https://`).
+   - `__SUPABASE_KEY__` por la clave publicable (anon / publishable). Es pública por diseño: la seguridad la da RLS.
+4. En `index.html`, la CSP (`connect-src`) también lleva `__SUPABASE_HOST__`: reemplazalo por el mismo host. Con `sed -i 's/__SUPABASE_HOST__/abcd.supabase.co/g' index.html config.js` alcanza para los dos archivos.
+5. Mientras queden placeholders, la app muestra "Falta configurar la app".
+6. Authentication → URL Configuration: poné **Site URL** = `https://<usuario>.github.io/listas/` y agregá la misma URL en **Redirect URLs**. Si no, con la confirmación de email activa el link del mail apunta a localhost y el alta queda rota.
+7. Authentication → Sign In / Providers → Email: subí la **longitud mínima de contraseña a 8** (el cliente la exige solo al crear cuenta; el servidor acepta 6 por defecto).
+
+`supabase/test_rls.sql` se puede correr incluso con datos reales: todo queda en una transacción con ROLLBACK y los chequeos miran solo sus filas de prueba. Si no aparece ningún error, pasó todo (el último resultado muestra `TODO OK`).
+
+## Habilitar a un miembro
+
+Crear una cuenta no da acceso a nada: quien se registra pero no está en `members` ve cero filas y la app le muestra "Falta que te habiliten". El dueño habilita desde el SQL editor, una vez por persona:
+
+```sql
+insert into public.members (user_id, name, color)
+select id, 'Nombre', '#ffd9c7' from auth.users where email = 'persona@ejemplo.com';
+```
+
+`name` va de 1 a 20 caracteres y `color` es un hex `#rrggbb`. Los nombres que muestra la app salen de esta tabla. Después la persona toca "Ya me habilitaron".
+
+## Dar de baja a un miembro
+
+`items.created_by` apunta a `members` sin `on delete`, así que no se puede borrar a un miembro (ni su usuario en Auth) mientras tenga ítems creados. Antes hay que reasignarlos o borrarlos, por ejemplo: `update public.items set created_by = '<otro user_id>' where created_by = '<user_id>';` corrido como `postgres` en el SQL editor. Se evita un `cascade` a propósito: borraría contenido compartido.
+
+## Cerrar los registros
+
+Cuando ya estén las dos cuentas: Authentication → Sign In / Providers → desactivá "Allow new users to sign up". Así nadie más puede crear cuentas (y aunque lo hiciera, RLS no le deja ver nada). Si desactivás también la confirmación de email, las cuentas entran sin confirmar; mantenela si preferís más control.
+
+## Publicar en GitHub Pages
+
+Settings → Pages → desplegar desde la rama principal, carpeta raíz. `.nojekyll` evita que Jekyll toque los archivos. La URL queda `https://<usuario>.github.io/listas/`.
+
+## Notas de seguridad
+
+- Toda la autorización está en Postgres (RLS + privilegios por columna), no en el cliente. La clave del frontend es publicable.
+- Solo el rol `authenticated` y solo si `is_member()` puede leer o escribir. El cliente envía únicamente `list`, `text`, `bucket`, `assignee` al insertar y `text`, `done`, `bucket`, `assignee` al actualizar; `id`, `created_by`, `created_at`, `done_at` y `updated_at` los fija la base. No se usa `upsert`.
+- `members` es solo lectura desde el cliente.
+- Hay un tope de 1000 filas en `items`.
+- Realtime con `postgres_changes`: INSERT y UPDATE se filtran por RLS, pero los DELETE no (limitación de Realtime): un usuario autenticado que no sea miembro podría recibir el `id` de una fila borrada, sin texto ni datos. Cerrar los registros lo elimina en la práctica.
+- GitHub Pages no permite cabeceras, así que no hay `frame-ancestors`; la app no arranca si la embeben en un iframe ajeno.
+- CSP estricta: `script-src 'self'`, sin inline, `connect-src` limitado a tu proyecto de Supabase, `form-action 'none'`, `base-uri 'none'`. Referrer desactivado.
+- Todo texto de usuario se pinta con `textContent`/nodos de texto; no se usa `innerHTML`.
+- No pongas nunca la clave `service_role` en este repo.
