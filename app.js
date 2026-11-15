@@ -106,6 +106,8 @@ function friendlyAuthError(err) {
   if (m.includes('valid email') || m.includes('invalid email')) return 'Ese email no parece válido.';
   if (m.includes('signups not allowed') || m.includes('signup is disabled')) return 'Los registros están cerrados.';
   if (m.includes('fetch') || m.includes('network')) return 'Sin conexión. Probá de nuevo en un rato.';
+  if (m.includes('different from the old')) return 'Tiene que ser distinta de la anterior.';
+  if (m.includes('session') && m.includes('missing')) return 'El link venció. Pedí otro desde "Olvidé mi contraseña".';
   return 'No se pudo completar. Probá de nuevo.';
 }
 
@@ -526,11 +528,28 @@ function viewAuth() {
     err.textContent = '';
     return { e, p };
   };
+  const forgot = h('button', { class: 'btn ghost block', type: 'button' }, 'Olvidé mi contraseña');
   const form = h('form', { class: 'card', novalidate: true },
     h('div', { class: 'field' }, h('label', null, 'Email', email)),
     h('div', { class: 'field' }, h('label', null, 'Contraseña', pass)),
     err,
-    h('div', { class: 'row' }, enter, create));
+    h('div', { class: 'row' }, enter, create),
+    forgot);
+  forgot.addEventListener('click', async () => {
+    const e = email.value.trim();
+    if (!e) { err.textContent = 'Poné tu email y tocá de nuevo "Olvidé mi contraseña".'; email.focus(); return; }
+    forgot.disabled = true;
+    err.style.color = '';
+    const { error } = await state.client.auth.resetPasswordForEmail(e, { redirectTo: location.origin + location.pathname });
+    if (error) {
+      err.textContent = friendlyAuthError(error);
+      forgot.disabled = false;
+      return;
+    }
+    err.style.color = 'inherit';
+    err.textContent = 'Si ese email tiene cuenta, te llegó un mail con un link. Abrilo desde este teléfono para elegir una contraseña nueva. Puede tardar un minuto; mirá también en spam.';
+    setTimeout(() => { forgot.disabled = false; }, 60000); // un pedido por minuto
+  });
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const v = check(); if (!v) return;
@@ -551,6 +570,36 @@ function viewAuth() {
     }
     if (!data?.session) { err.textContent = 'Listo. Revisá tu email para confirmar la cuenta y después entrá.'; busy(false); }
   });
+  return h('div', { class: 'center-screen' }, h('h1', null, 'Listas'), form);
+}
+
+function viewRecovery() {
+  const err = h('div', { class: 'form-error', role: 'alert' });
+  const pass = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: 'Mínimo 8 caracteres', 'aria-label': 'Contraseña nueva' });
+  const pass2 = h('input', { class: 'input', type: 'password', autocomplete: 'new-password', placeholder: 'Repetila', 'aria-label': 'Repetir contraseña' });
+  const save = h('button', { class: 'btn primary block', type: 'submit' }, 'Guardar contraseña');
+  const form = h('form', { class: 'card', novalidate: true },
+    h('p', null, 'Elegí tu contraseña nueva.'),
+    h('div', { class: 'field' }, h('label', null, 'Contraseña nueva', pass)),
+    h('div', { class: 'field' }, h('label', null, 'Repetila', pass2)),
+    err,
+    save);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if (pass.value.length < 8) { err.textContent = 'La contraseña tiene que tener al menos 8 caracteres.'; pass.focus(); return; }
+    if (pass.value !== pass2.value) { err.textContent = 'Las dos no coinciden.'; pass2.focus(); return; }
+    save.disabled = true;
+    const { error } = await state.client.auth.updateUser({ password: pass.value });
+    if (error) { err.textContent = friendlyAuthError(error); save.disabled = false; return; }
+    state.recovering = false;
+    if (/access_token|type=recovery/.test(location.hash)) {
+      history.replaceState(null, '', location.pathname + location.search); // sacar el token de la barra
+      parseRoute();
+    }
+    toast('Listo, contraseña cambiada');
+    enterSession();
+  });
+  setTimeout(() => pass.focus(), 0);
   return h('div', { class: 'center-screen' }, h('h1', null, 'Listas'), form);
 }
 
@@ -724,6 +773,7 @@ function render() {
   let view;
   if (state.phase === 'config') view = viewConfig();
   else if (state.phase === 'auth') view = viewAuth();
+  else if (state.phase === 'recovery') view = viewRecovery();
   else if (state.phase === 'waiting') view = viewWaiting();
   else if (state.phase === 'error') view = viewError();
   else if (ready && !state.loaded) view = viewLoading();
@@ -784,6 +834,16 @@ async function signOut() {
 }
 
 function onAuth(session) {
+  // Vino del link de "Olvidé mi contraseña": primero la clave nueva.
+  if (session && state.recovering) {
+    enterGen++;
+    unsubscribe();
+    state.session = session;
+    closeSheet();
+    state.phase = 'recovery';
+    render();
+    return;
+  }
   // supabase-js re-emite SIGNED_IN al volver a la pestaña: si es la misma persona, no reiniciar.
   if (session && state.session && state.session.user.id === session.user.id && state.phase === 'ready') {
     state.session = session;
@@ -809,10 +869,24 @@ function boot() {
   if (window.top !== window.self) { document.documentElement.hidden = true; return; }
   const configured = CFG.url && CFG.key && SB && !/__SUPABASE_/.test(CFG.url + CFG.key);
   if (!configured) { state.phase = 'config'; render(); return; }
+
+  // Link del mail de recuperación: trae #...type=recovery (o un error si venció).
+  const urlHash = location.hash;
+  if (/[#&]type=recovery(&|$)/.test(urlHash)) state.recovering = true;
+  const linkErr = /[#&]error_code=([^&]*)/.exec(urlHash);
+  if (linkErr) {
+    history.replaceState(null, '', location.pathname + location.search);
+    parseRoute();
+    setTimeout(() => toast(linkErr[1] === 'otp_expired'
+      ? 'El link venció o ya se usó. Pedí otro desde "Olvidé mi contraseña".'
+      : 'El link no sirvió. Pedí otro desde "Olvidé mi contraseña".'), 0);
+  }
+
   state.client = SB.createClient(CFG.url, CFG.key, { auth: { persistSession: true, autoRefreshToken: true } });
 
   state.client.auth.onAuthStateChange((event, session) => {
     // Diferido: no hacer llamadas a Supabase dentro del callback.
+    if (event === 'PASSWORD_RECOVERY') state.recovering = true;
     if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') { state.session = session; return; }
     setTimeout(() => onAuth(session), 0);
   });
