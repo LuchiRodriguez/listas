@@ -78,3 +78,18 @@ Además de las listas, la app ahora tiene:
 3. Corré `supabase/test_v2.sql` para comprobar las políticas (todo en una transacción con ROLLBACK; el último resultado dice `TODO OK`).
 
 **Orden:** corré `v2.sql` ANTES de publicar el front nuevo. Si se publica antes, las listas siguen andando (la app cae a las columnas de v1) pero las pantallas nuevas quedan vacías y no se cuentan los aportes. Los datos se traen paginados (1000 por pedido), así que el límite de filas de Supabase no recorta el historial.
+
+## v3: quehaceres de la casa
+
+- **Quehaceres**: en el inicio, la tarjeta "Esta semana" y la pantalla #/aportes tienen "🧹 Hice algo de la casa". Abre una hoja con un chip por quehacer (lavar la ropa, colgar la ropa, vaciar el tender, cocinar, lavar los platos, hacer la cama, cambiar sábanas, cambiar toallas, limpiar y ordenar la habitación, regar las plantas) y "Otra…" con texto libre. Un toque suma 1 aporte a la torta; la hoja queda abierta para registrar varios y cada uno se puede deshacer al instante (cada uno deshace solo lo suyo).
+- **Tabla de aportes**: además de las filas de siempre aparece una sección "Casa" con los quehaceres del período y un "Total casa".
+- **Vales**: se suma "Vale por un chocolate" a los preajustes.
+- **Inicio**: la tarjeta de Mimos pasa arriba de todo, debajo del saludo y del aviso de mimos sin ver.
+
+### Aplicar v3
+
+1. v1 y v2 tienen que estar aplicadas.
+2. En el SQL Editor pegá `supabase/v3.sql` entero. Es idempotente.
+3. Corré `supabase/test_v3.sql` (todo en una transacción con ROLLBACK; el último resultado dice `TODO OK`).
+
+**Orden:** corré `v3.sql` ANTES de publicar el front nuevo. Si se publica antes, la app cae a las columnas de v2 (sin `detalle`) y los botones de quehaceres fallan con "No se pudo sumar" hasta aplicar el SQL; lo demás sigue andando. Además, el canal de tiempo real incluye `quehaceres`: si la tabla todavía no está en la publicación, Supabase puede rechazar el canal y cortar el tiempo real de todo, así que no publiques antes de aplicar `v3.sql`.

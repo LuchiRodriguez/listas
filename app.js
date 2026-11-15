@@ -7,7 +7,7 @@
 const CFG = window.LISTAS_CONFIG || {};
 import {
   TIPOS_APORTE, parseEuros, fmtEUR, centsToInput, saldoHalf, saldoCents, localISODate, monthKey, addMonthKey, monthLabel, monthName,
-  cap, lastDayOfMonth, fechaCorta, period, contarAportes, porcentajes, mesCierrePorDefecto, mesFindeDeCierre, resumenGastosMes,
+  cap, lastDayOfMonth, QUEHACERES, filasCasa, fechaCorta, period, contarAportes, porcentajes, mesCierrePorDefecto, mesFindeDeCierre, resumenGastosMes,
 } from './calc.js';
 
 const SB = window.supabase;
@@ -15,7 +15,8 @@ const ITEM_COLS_V1 = 'id,list,text,done,done_at,bucket,assignee,created_by,creat
 let ITEM_COLS = 'id,list,text,done,done_at,done_by,bucket,assignee,created_by,created_at'; // cae a v1 si v2.sql aún no está aplicada
 const GASTO_COLS = 'id,tipo,descripcion,monto_cent,pagado_por,reparto,fecha,created_by,created_at';
 const MIMO_COLS = 'id,de,para,tipo,texto,visto,canjeado,canjeado_at,created_at';
-const ACT_COLS = 'id,actor,tipo,item_id,at';
+let ACT_COLS = 'id,actor,tipo,item_id,detalle,at'; // cae a v2 si v3.sql aún no está aplicada
+const ACT_COLS_V2 = 'id,actor,tipo,item_id,at';
 const CIERRE_COLS = 'mes,aprendimos,mejoramos,trabajando,updated_by,updated_at';
 const CIERRE_FIELDS = ['aprendimos', 'mejoramos', 'trabajando'];
 const CIERRE_Q = [
@@ -29,7 +30,7 @@ const MIMOS = {
   gracias: { emoji: '🙏', name: 'Gracias' },
   vale: { emoji: '🎁', name: 'Vale' },
 };
-const VALES = ['Vale por un masaje', 'Vale por unos mimos', 'Vale por unos besitos', 'Vale por un desayuno en la cama', 'Vale por elegir la peli'];
+const VALES = ['Vale por un masaje', 'Vale por unos mimos', 'Vale por unos besitos', 'Vale por un desayuno en la cama', 'Vale por elegir la peli', 'Vale por un chocolate'];
 const ROUTES = ['super', 'tareas', 'gastos', 'aportes', 'mimos', 'cierre'];
 const ACT_DAYS = 400;
 const MEMBER_COLS = 'user_id,name,color';
@@ -181,7 +182,7 @@ async function loadItems() {
       }
       return { data: all, error: null };
     };
-    const [ir0, mr, gr, mir, ar, cr] = await withTimeout(Promise.all([
+    const [ir0, mr, gr, mir, ar0, cr] = await withTimeout(Promise.all([
       fetchItems(),
       state.client.from('members').select(MEMBER_COLS),
       pages(() => state.client.from('gastos').select(GASTO_COLS).order('fecha', { ascending: false }).order('created_at', { ascending: false }).order('id'), 5000),
@@ -189,10 +190,14 @@ async function loadItems() {
       pages(() => state.client.from('actividad').select(ACT_COLS).gte('at', since).order('at', { ascending: false }).order('id', { ascending: false }), 10000),
       state.client.from('cierres').select(CIERRE_COLS),
     ]));
-    let ir = ir0;
+    let ir = ir0, ar = ar0;
     if (ir.error && ITEM_COLS.includes('done_by')) { // v2.sql todavía no aplicada: seguir con las columnas de v1
       ITEM_COLS = ITEM_COLS_V1;
       ir = await withTimeout(fetchItems());
+    }
+    if (ar.error && ACT_COLS.includes('detalle')) { // v3.sql todavía no aplicada: seguir con las columnas de v2
+      ACT_COLS = ACT_COLS_V2;
+      ar = await withTimeout(pages(() => state.client.from('actividad').select(ACT_COLS).gte('at', since).order('at', { ascending: false }).order('id', { ascending: false }), 10000));
     }
     if (ir.error) throw ir.error;
     if (state.phase !== 'ready' || state.session?.user.id !== uid) return; // cambió la sesión mientras tanto
@@ -345,6 +350,19 @@ async function sendMimo(tipo, texto) {
   state.seenMimos.add(data.id);
   render();
   return data;
+}
+
+/** Un quehacer, un toque. Solo viaja la columna 'que'; quién y cuándo los pone la base. */
+async function insertQuehacer(que) {
+  const { data, error } = await write(() => state.client.from('quehaceres').insert({ que }).select('id').single());
+  if (error) throw error;
+  return data;
+}
+
+async function deleteQuehacer(id) {
+  const { data, error } = await write(() => state.client.from('quehaceres').delete().eq('id', id).select('id'));
+  if (error) throw error;
+  if (!data || !data.length) throw new Error('ya no estaba');
 }
 
 async function deleteMimo(m) {
@@ -513,7 +531,7 @@ async function subscribe() {
     state.rt = 'CONNECTING';
     // Topic único por intento: channel() devuelve el canal viejo si el topic ya existe.
     const ch = state.client.channel('items-' + (++chSeq));
-    for (const table of ['items', 'gastos', 'mimos', 'cierres', 'actividad']) {
+    for (const table of ['items', 'gastos', 'mimos', 'cierres', 'actividad', 'quehaceres']) {
       ch.on('postgres_changes', { event: '*', schema: 'public', table }, () => refetch());
     }
     ch.subscribe((status) => {
@@ -950,7 +968,7 @@ function viewHome() {
         h('h1', { class: 'hello' }, `Hola, ${me()?.name || ''} 👋`),
         h('button', { class: 'btn ghost', type: 'button', onclick: signOut }, 'Salir')),
       liveLine()),
-    mimoBanner(), superCard, tasksCard, gastosCard(), weekCard(), mimosCard(), cierreCard(),
+    mimoBanner(), mimosCard(), superCard, tasksCard, gastosCard(), weekCard(), cierreCard(),
     h('a', { class: 'more-link soft', href: '#/cierre' }, 'Cierre del mes →'));
 }
 
@@ -1058,10 +1076,19 @@ function pieLegend(porActor) {
 
 function aportesTabla(c) {
   const ids = bothIds();
-  return h('table', { class: 'tabla' },
-    h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Aporte'), ids.map((id) => h('th', { scope: 'col' }, memberName(id))))),
-    h('tbody', null, TIPOS_APORTE.map(([tipo, nombre]) =>
-      h('tr', null, h('th', { scope: 'row' }, nombre), ids.map((id) => h('td', null, String(c.porTipo[tipo]?.[id] || 0)))))));
+  const casa = filasCasa(c);
+  const head = h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Aporte'), ids.map((id) => h('th', { scope: 'col' }, memberName(id)))));
+  const rows = TIPOS_APORTE.map(([tipo, nombre]) =>
+    h('tr', null, h('th', { scope: 'row' }, nombre), ids.map((id) => h('td', null, String(c.porTipo[tipo]?.[id] || 0)))));
+  const tabla = h('table', { class: 'tabla' }, head, h('tbody', null, rows));
+  if (!casa.length) return [tabla, h('p', { class: 'muted small casa-vacia' }, 'Todavía no registraron cosas de la casa')];
+  const totalCasa = (id) => casa.reduce((s, r) => s + (r.porActor[id] || 0), 0);
+  const casaTabla = h('table', { class: 'tabla casa' },
+    h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Casa 🏠'), ids.map((id) => h('th', { scope: 'col' }, memberName(id))))),
+    h('tbody', null,
+      casa.map((r) => h('tr', null, h('th', { scope: 'row' }, `${r.emoji} ${r.nombre}`), ids.map((id) => h('td', null, String(r.porActor[id] || 0))))),
+      h('tr', { class: 'total' }, h('th', { scope: 'row' }, 'Total casa'), ids.map((id) => h('td', null, String(totalCasa(id)))))));
+  return [tabla, casaTabla];
 }
 
 function aportesDe(per) { return contarAportes(state.actividad, per.start, per.end, bothIds()); }
@@ -1103,7 +1130,9 @@ function weekCard() {
         h('div', { class: 'pie-side' }, pieLegend(c.porActor), h('div', { class: 'muted' }, `${c.total} ${c.total === 1 ? 'aporte' : 'aportes'}`)))
       : h('div', { class: 'preview' }, 'Todavía no hay aportes esta semana'),
     c.total > 0 && h('div', { class: 'foot' }, 'Así se repartió la carga esta semana'),
-    h('a', { class: 'more-link', href: '#/aportes' }, 'Ver aportes →'));
+    h('div', { class: 'row card-actions' },
+      h('button', { class: 'btn primary', type: 'button', onclick: (e) => { e.stopPropagation(); openQuehaceresSheet(); } }, '🧹 Hice algo de la casa'),
+      h('a', { class: 'more-link', href: '#/aportes', onclick: (e) => e.stopPropagation() }, 'Ver aportes →')));
 }
 
 function mimosCard() {
@@ -1120,6 +1149,59 @@ function cierreCard() {
   return h('section', { class: 'card tap cierre-card', onclick: () => { location.hash = `#/cierre/${key}`; } },
     h('p', null, `🗓️ Es finde de cierre de ${monthName(key)}. ¿Se hacen un rato para charlarlo?`),
     h('a', { class: 'more-link', href: `#/cierre/${key}` }, 'Ir al cierre →'));
+}
+
+/* ---------- Quehaceres (v3) ---------- */
+
+const busyChips = new Set(); // guardia contra doble toque mientras se guarda (a nivel módulo: sobrevive a cerrar y reabrir la hoja)
+
+function openQuehaceresSheet() {
+  openSheet('¿Qué hiciste? 🧹', ({ focus }) => {
+    const feedback = h('div', { class: 'added', role: 'status', 'aria-live': 'polite' });
+    let undoBusy = false;
+    const sumar = async (que, emoji, key) => {
+      if (busyChips.has(key)) return false;
+      busyChips.add(key);
+      try {
+        const row = await insertQuehacer(que);
+        const undo = h('button', { class: 'link-btn', type: 'button' }, 'Deshacer');
+        undo.addEventListener('click', async () => {
+          if (undoBusy) return;
+          undoBusy = true; undo.disabled = true;
+          try { await deleteQuehacer(row.id); feedback.replaceChildren(`Deshecho: ${que}`); toast(`Se deshizo: ${que}`); }
+          catch (e) { console.warn('deshacer quehacer', e?.message); toast('No se pudo deshacer, probá de nuevo'); undo.disabled = false; }
+          finally { undoBusy = false; }
+        });
+        feedback.replaceChildren(`Sumaste: ${que} ${emoji} · `, undo);
+        toast(`Sumaste: ${que} ${emoji}`);
+        return true;
+      } catch (e) { console.warn('quehacer', e?.message); toast('No se pudo sumar, probá de nuevo'); return false; }
+      finally { busyChips.delete(key); }
+    };
+    const grid = h('div', { class: 'quehacer-grid' }, QUEHACERES.map(([emoji, nombre]) => {
+      const b = h('button', { class: 'quehacer-chip', type: 'button' }, h('span', { class: 'qh-emoji', 'aria-hidden': 'true' }, emoji), h('span', null, nombre));
+      b.addEventListener('click', () => { sumar(nombre, emoji, nombre).finally(() => { b.disabled = false; }); b.disabled = busyChips.has(nombre); });
+      return b;
+    }));
+    const otra = h('button', { class: 'quehacer-chip', type: 'button' }, h('span', { class: 'qh-emoji', 'aria-hidden': 'true' }, '✏️'), h('span', null, 'Otra…'));
+    grid.appendChild(otra);
+    const input = h('input', { class: 'input', type: 'text', maxlength: 40, placeholder: '¿Qué hiciste?', 'aria-label': 'Otra cosa de la casa', enterkeyhint: 'send', autocomplete: 'off' });
+    const add = h('button', { class: 'btn primary block', type: 'button' }, 'Sumar');
+    const custom = h('div', { class: 'stack' }, input, add);
+    custom.hidden = true;
+    otra.addEventListener('click', () => { custom.hidden = false; input.focus(); });
+    const go = async () => {
+      const t = cleanText(input.value, 40);
+      if (!t) { input.focus(); return; }
+      add.disabled = true;
+      if (await sumar(t, '✏️', '__otra')) input.value = '';
+      add.disabled = false;
+    };
+    add.addEventListener('click', go);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    focus(grid.firstChild);
+    return h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'Un toque y suma. Podés registrar varias seguidas.'), grid, custom, feedback);
+  });
 }
 
 /* ---------- Mimos ---------- */
@@ -1418,6 +1500,7 @@ function viewAportes() {
   const seg = segmented([['semana', 'Semana'], ['mes', 'Mes']], () => state.apKind, (v) => { state.apKind = v; state.apOffset = 0; render(); }, 'Período');
   return h('div', { class: 'stack' },
     topbar('Aportes 🥧'),
+    h('button', { class: 'btn primary block', type: 'button', onclick: openQuehaceresSheet }, '🧹 Hice algo de la casa'),
     seg,
     periodNav(per.label, canPrev, state.apOffset > 0, () => { state.apOffset++; render(); }, () => { state.apOffset--; render(); }),
     h('section', { class: 'card pie-card' },
@@ -1425,7 +1508,7 @@ function viewAportes() {
       pieLegend(c.porActor),
       h('p', { class: 'muted' }, c.total ? `${c.total} ${c.total === 1 ? 'aporte' : 'aportes'} · así se repartió la carga` : 'Sin aportes en este período'),
       aportesTabla(c)),
-    h('p', { class: 'muted small center' }, 'Cuenta desde que existe el historial. Agregar, tildar, cargar gastos y mandar mimos suman por igual.'));
+    h('p', { class: 'muted small center' }, 'Cuenta desde que existe el historial. Agregar, tildar, cargar gastos, mandar mimos y las cosas de la casa suman por igual.'));
 }
 
 /* ---------- Cierre del mes ---------- */

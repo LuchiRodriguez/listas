@@ -9,6 +9,13 @@ export const TIPOS_APORTE = [
   ['mimo', 'Mimos'],
 ];
 
+/** Quehaceres de la casa (v3): [emoji, nombre]. El nombre es lo que se guarda en quehaceres.que. */
+export const QUEHACERES = [
+  ['🧺', 'Lavar la ropa'], ['👕', 'Colgar la ropa'], ['🧦', 'Vaciar el tender'], ['🍳', 'Cocinar'], ['🍽️', 'Lavar los platos'],
+  ['🛏️', 'Hacer la cama'], ['🛌', 'Cambiar sábanas'], ['🛁', 'Cambiar toallas'], ['🧹', 'Limpiar habitación'],
+  ['📦', 'Ordenar habitación'], ['🪴', 'Regar las plantas'],
+];
+
 export const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
 const MESES_CORTOS = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
 
@@ -103,7 +110,7 @@ export function period(kind, offset, now = new Date()) {
 
 /** { total, porActor: {id: n}, porTipo: {tipo: {id: n}} } de las filas de actividad dentro de [start, end). */
 export function contarAportes(actividad, start, end, actores) {
-  const out = { total: 0, porActor: {}, porTipo: {} };
+  const out = { total: 0, porActor: {}, porTipo: {}, porDetalle: Object.create(null) };
   actores.forEach((a) => { out.porActor[a] = 0; });
   const t0 = start.getTime(), t1 = end.getTime();
   for (const r of actividad) {
@@ -113,8 +120,25 @@ export function contarAportes(actividad, start, end, actores) {
     out.porActor[r.actor]++;
     const pt = (out.porTipo[r.tipo] = out.porTipo[r.tipo] || {});
     pt[r.actor] = (pt[r.actor] || 0) + 1;
+    if (r.tipo === 'quehacer') {
+      const nom = r.detalle || 'Otra cosa';
+      const pd = (out.porDetalle[nom] = out.porDetalle[nom] || Object.create(null));
+      pd[r.actor] = (pd[r.actor] || 0) + 1;
+    }
   }
   return out;
+}
+
+/** Filas de la sección "Casa": [{ nombre, emoji, porActor }] con al menos 1; primero los presets en orden, después el resto alfabético. */
+export function filasCasa(c) {
+  const rows = [];
+  const usados = new Set();
+  for (const [emoji, nombre] of QUEHACERES) {
+    if (c.porDetalle[nombre]) { rows.push({ nombre, emoji, porActor: c.porDetalle[nombre] }); usados.add(nombre); }
+  }
+  Object.keys(c.porDetalle).filter((n) => !usados.has(n)).sort((a, b) => a.localeCompare(b, 'es'))
+    .forEach((nombre) => rows.push({ nombre, emoji: '✏️', porActor: c.porDetalle[nombre] }));
+  return rows;
 }
 
 /** Porcentajes enteros que suman 100 (con dos personas; con una sola, 100). */
