@@ -121,8 +121,9 @@ declare n int;
 begin
   select count(*) into n from public.items where text in ('leche', 'llamar');
   if n <> 2 then raise exception 'B deberia ver lo de A, ve %', n; end if;
-  select count(*) into n from public.members;
-  if n <> 2 then raise exception 'B deberia ver 2 members, ve %', n; end if;
+  select count(*) into n from public.members
+    where user_id in ('aaaaaaaa-0000-0000-0000-000000000001', 'bbbbbbbb-0000-0000-0000-000000000002');
+  if n <> 2 then raise exception 'B deberia ver los 2 members de prueba, ve %', n; end if;
   update public.items set done = true where text = 'llamar';
   get diagnostics n = row_count;
   if n <> 1 then raise exception 'B no pudo tildar'; end if;

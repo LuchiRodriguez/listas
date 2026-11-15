@@ -1,11 +1,37 @@
 // Listas — súper y tareas compartidas, en vivo. JS vanilla, sin build.
+// v2 "convivencia": gastos, aportes, mimos y cierre de mes (cálculos puros en calc.js).
 // Secciones: constantes · estado · utilidades · datos · realtime · hojas · componentes · pantallas · arranque.
 
 /* ============================== Constantes ============================== */
 
 const CFG = window.LISTAS_CONFIG || {};
+import {
+  TIPOS_APORTE, parseEuros, fmtEUR, centsToInput, saldoHalf, saldoCents, localISODate, monthKey, addMonthKey, monthLabel, monthName,
+  cap, lastDayOfMonth, fechaCorta, period, contarAportes, porcentajes, mesCierrePorDefecto, mesFindeDeCierre, resumenGastosMes,
+} from './calc.js';
+
 const SB = window.supabase;
-const ITEM_COLS = 'id,list,text,done,done_at,bucket,assignee,created_by,created_at';
+const ITEM_COLS_V1 = 'id,list,text,done,done_at,bucket,assignee,created_by,created_at';
+let ITEM_COLS = 'id,list,text,done,done_at,done_by,bucket,assignee,created_by,created_at'; // cae a v1 si v2.sql aún no está aplicada
+const GASTO_COLS = 'id,tipo,descripcion,monto_cent,pagado_por,reparto,fecha,created_by,created_at';
+const MIMO_COLS = 'id,de,para,tipo,texto,visto,canjeado,canjeado_at,created_at';
+const ACT_COLS = 'id,actor,tipo,item_id,at';
+const CIERRE_COLS = 'mes,aprendimos,mejoramos,trabajando,updated_by,updated_at';
+const CIERRE_FIELDS = ['aprendimos', 'mejoramos', 'trabajando'];
+const CIERRE_Q = [
+  ['aprendimos', '¿Qué aprendimos este mes?'],
+  ['mejoramos', '¿Qué mejoramos?'],
+  ['trabajando', '¿En qué seguimos trabajando?'],
+];
+const MIMOS = {
+  corazon: { emoji: '❤️', name: 'Corazón' },
+  beso: { emoji: '💋', name: 'Beso' },
+  gracias: { emoji: '🙏', name: 'Gracias' },
+  vale: { emoji: '🎁', name: 'Vale' },
+};
+const VALES = ['Vale por un masaje', 'Vale por unos mimos', 'Vale por unos besitos', 'Vale por un desayuno en la cama', 'Vale por elegir la peli'];
+const ROUTES = ['super', 'tareas', 'gastos', 'aportes', 'mimos', 'cierre'];
+const ACT_DAYS = 400;
 const MEMBER_COLS = 'user_id,name,color';
 const BUCKETS = [['hoy', 'Hoy'], ['semana', 'Semana'], ['algun_dia', 'Algún día']];
 const BUCKET_TITLES = { hoy: 'Hoy', semana: 'Esta semana', algun_dia: 'Algún día' };
@@ -20,7 +46,21 @@ const state = {
   members: [],
   items: [],
   phase: 'boot',        // boot | config | auth | waiting | ready
-  route: 'home',        // home | super | tareas
+  route: 'home',        // home | super | tareas | gastos | aportes | mimos | cierre
+  routeArg: null,       // mes (AAAA-MM) de #/cierre/AAAA-MM
+  gastos: [],
+  mimos: [],
+  actividad: [],
+  cierres: [],
+  apKind: 'semana',     // selector de #/aportes
+  apOffset: 0,
+  mimosInit: false,     // ya se vio la primera carga de mimos (para no avisar los viejos)
+  seenMimos: new Set(), // mimos ya vistos en esta sesión
+  freshMimos: new Set(),// los que estaban sin ver al entrar a #/mimos (se resaltan)
+  cierreDraft: {},      // mes -> { campo: texto } escrito y todavía no guardado
+  cierreSeen: null,     // mes -> updated_at, para avisar cambios del otro
+  markBlockUntil: 0,
+  sendingMimo: false,
   rt: 'CLOSED',         // estado del canal realtime
   channel: null,
   filter: 'all',        // all | mine | other
@@ -64,16 +104,18 @@ function h(tag, props, ...children) {
   return el;
 }
 
-function toast(msg) {
+function toast(msg, emoji) {
   const box = document.getElementById('toasts');
-  const t = h('div', { class: 'toast' }, msg);
+  const t = emoji
+    ? h('div', { class: 'toast big' }, h('span', { class: 'toast-emoji', 'aria-hidden': 'true' }, emoji), h('span', null, msg))
+    : h('div', { class: 'toast' }, msg);
   box.appendChild(t);
-  setTimeout(() => t.remove(), 3500);
+  setTimeout(() => t.remove(), emoji ? 6000 : 3500);
 }
 
-function cleanText(s) {
+function cleanText(s, max = MAX_TEXT) {
   const t = String(s ?? '').trim();
-  return t.length >= 1 && t.length <= MAX_TEXT ? t : null;
+  return t.length >= 1 && t.length <= max ? t : null;
 }
 
 function timeAgo(iso) {
@@ -126,10 +168,32 @@ async function loadItems() {
   const uid = state.session?.user.id;
   const seq = state.writeSeq;
   try {
-    const [ir, mr] = await withTimeout(Promise.all([
-      state.client.from('items').select(ITEM_COLS).order('created_at', { ascending: true }).limit(1000),
+    const since = new Date(Date.now() - ACT_DAYS * DAY).toISOString();
+    const fetchItems = () => state.client.from('items').select(ITEM_COLS).order('created_at', { ascending: true }).limit(1000);
+    // PostgREST recorta a max-rows (1000 por defecto): se pagina con range() hasta traer todo.
+    const pages = async (mk, max) => {
+      const all = [];
+      for (let from = 0; from < max; from += 1000) {
+        const r = await mk().range(from, from + 999);
+        if (r.error) return r;
+        all.push(...r.data);
+        if (r.data.length < 1000) break;
+      }
+      return { data: all, error: null };
+    };
+    const [ir0, mr, gr, mir, ar, cr] = await withTimeout(Promise.all([
+      fetchItems(),
       state.client.from('members').select(MEMBER_COLS),
+      pages(() => state.client.from('gastos').select(GASTO_COLS).order('fecha', { ascending: false }).order('created_at', { ascending: false }).order('id'), 5000),
+      pages(() => state.client.from('mimos').select(MIMO_COLS).order('created_at', { ascending: false }).order('id'), 5000),
+      pages(() => state.client.from('actividad').select(ACT_COLS).gte('at', since).order('at', { ascending: false }).order('id', { ascending: false }), 10000),
+      state.client.from('cierres').select(CIERRE_COLS),
     ]));
+    let ir = ir0;
+    if (ir.error && ITEM_COLS.includes('done_by')) { // v2.sql todavía no aplicada: seguir con las columnas de v1
+      ITEM_COLS = ITEM_COLS_V1;
+      ir = await withTimeout(fetchItems());
+    }
     if (ir.error) throw ir.error;
     if (state.phase !== 'ready' || state.session?.user.id !== uid) return; // cambió la sesión mientras tanto
     const wasLoaded = state.loaded, hadFailed = state.loadFailed;
@@ -142,7 +206,14 @@ async function loadItems() {
     } else {
       const next = ir.data || [];
       if (JSON.stringify(next) !== JSON.stringify(state.items)) { state.items = next; changed = true; }
+      // Las tablas de v2 son opcionales: si una falla, se conserva lo anterior.
+      for (const [key, res] of [['gastos', gr], ['mimos', mir], ['actividad', ar], ['cierres', cr]]) {
+        if (res.error || !res.data) { console.warn('load ' + key, res.error?.message); continue; }
+        if (JSON.stringify(res.data) !== JSON.stringify(state[key])) { state[key] = res.data; changed = true; }
+      }
       state.loaded = true; state.loadFailed = false;
+      notifyMimos(!mir.error);
+      watchCierres();
     }
     if (changed || wasLoaded !== state.loaded || hadFailed !== state.loadFailed) render();
   } catch (e) {
@@ -229,6 +300,200 @@ async function deleteDone(list) {
   render();
 }
 
+/* ------------------------------ Datos de v2 ------------------------------ */
+
+const todayISO = () => localISODate(new Date());
+
+async function insertGasto(row) {
+  // Solo columnas permitidas: tipo, descripcion, monto_cent, pagado_por, reparto, fecha.
+  const r = { tipo: row.tipo, descripcion: row.descripcion, monto_cent: row.monto_cent, pagado_por: row.pagado_por, reparto: row.reparto, fecha: row.fecha };
+  const { data, error } = await write(() => state.client.from('gastos').insert(r).select(GASTO_COLS).single());
+  if (error) throw error;
+  if (!state.gastos.some((g) => g.id === data.id)) state.gastos.push(data);
+  render();
+  return data;
+}
+
+async function updateGasto(g, changes) {
+  // Solo columnas permitidas: descripcion, monto_cent, pagado_por, reparto, fecha.
+  const r = {};
+  for (const k of ['descripcion', 'monto_cent', 'pagado_por', 'reparto', 'fecha']) if (k in changes) r[k] = changes[k];
+  const { data, error } = await write(() => state.client.from('gastos').update(r).eq('id', g.id).select(GASTO_COLS));
+  if (error) throw error;
+  if (!data || !data.length) throw new Error('missing');
+  const cur = state.gastos.find((x) => x.id === g.id);
+  if (cur) Object.assign(cur, data[0]);
+  render();
+}
+
+async function deleteGasto(g) {
+  const { error } = await write(() => state.client.from('gastos').delete().eq('id', g.id));
+  if (error) throw error;
+  state.gastos = state.gastos.filter((x) => x.id !== g.id);
+  render();
+}
+
+async function sendMimo(tipo, texto) {
+  // Solo columnas permitidas: para, tipo, texto.
+  const o = other();
+  if (!o) throw new Error('solo');
+  const r = { para: o.user_id, tipo };
+  if (texto) r.texto = texto;
+  const { data, error } = await write(() => state.client.from('mimos').insert(r).select(MIMO_COLS).single());
+  if (error) throw error;
+  if (!state.mimos.some((m) => m.id === data.id)) state.mimos.unshift(data);
+  state.seenMimos.add(data.id);
+  render();
+  return data;
+}
+
+async function deleteMimo(m) {
+  const { error } = await write(() => state.client.from('mimos').delete().eq('id', m.id));
+  if (error) throw error;
+  state.mimos = state.mimos.filter((x) => x.id !== m.id);
+  render();
+}
+
+async function canjearMimo(m) {
+  if (inflight.has(m.id)) return;
+  inflight.add(m.id);
+  const prev = { canjeado: m.canjeado, canjeado_at: m.canjeado_at };
+  m.canjeado = true; m.canjeado_at = new Date().toISOString();
+  render();
+  let failed = false;
+  try {
+    // Solo columna permitida: canjeado (y visto al entrar a #/mimos).
+    const { data, error } = await write(() => state.client.from('mimos').update({ canjeado: true }).eq('id', m.id).select('id'));
+    failed = !!error || !data || data.length === 0;
+  } catch (e) { failed = true; }
+  inflight.delete(m.id);
+  if (failed) {
+    const now = state.mimos.find((x) => x.id === m.id);
+    if (now) Object.assign(now, prev);
+    render();
+    toast('No se pudo canjear, probá de nuevo');
+  } else {
+    const from = memberById(m.de)?.name || 'Alguien';
+    toast(`Canjeado. ${from} ya sabe que lo vas a cobrar 😏`, '🎁');
+  }
+}
+
+const unseenForMe = () => {
+  const id = me()?.user_id;
+  return state.mimos.filter((m) => m.para === id && !m.visto).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+};
+
+/** Al estar en #/mimos, los recibidos sin ver pasan a vistos (solo los dirigidos a mí). */
+function ensureSeen() {
+  if (state.route !== 'mimos' || state.phase !== 'ready' || !state.loaded) return;
+  const un = unseenForMe();
+  if (!un.length || Date.now() < state.markBlockUntil) return;
+  un.forEach((m) => { state.freshMimos.add(m.id); state.seenMimos.add(m.id); m.visto = true; });
+  const myId = me().user_id;
+  write(() => state.client.from('mimos').update({ visto: true }).eq('para', myId).eq('visto', false).select('id'))
+    .then(({ error }) => { if (error) { state.markBlockUntil = Date.now() + 30000; console.warn('visto', error.message); } })
+    .catch((e) => { state.markBlockUntil = Date.now() + 30000; console.warn('visto', e?.message); });
+}
+
+/** "💋 Mati te mandó un beso", "🎁 Mati te regaló: Vale por un masaje", "🙏 Mati te dio las gracias: …" */
+function mimoPhrase(m) {
+  const name = memberById(m.de)?.name || 'Alguien';
+  if (m.tipo === 'corazon') return `${name} te mandó un corazón`;
+  if (m.tipo === 'beso') return `${name} te mandó un beso`;
+  if (m.tipo === 'gracias') return m.texto ? `${name} te dio las gracias: ${m.texto}` : `${name} te dio las gracias`;
+  return `${name} te regaló: ${m.texto}`;
+}
+
+/** Aviso especial de mimos nuevos para mí. En la primera carga no avisa (para eso está el banner del inicio). */
+function notifyMimos(mimosOk) {
+  const myId = me()?.user_id;
+  if (!myId || !mimosOk) return;
+  if (!state.mimosInit) {
+    state.mimos.forEach((m) => state.seenMimos.add(m.id));
+    state.mimosInit = true;
+    return;
+  }
+  const fresh = state.mimos.filter((m) => !state.seenMimos.has(m.id));
+  fresh.forEach((m) => state.seenMimos.add(m.id));
+  fresh.filter((m) => m.para === myId && !m.visto)
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    .forEach((m) => toast(mimoPhrase(m), MIMOS[m.tipo]?.emoji || '💌'));
+}
+
+/** Si el otro guarda el cierre del mes que estoy mirando, avisar (sin repintar lo que estoy escribiendo). */
+function watchCierres() {
+  const myId = me()?.user_id;
+  const first = state.cierreSeen === null;
+  if (first) state.cierreSeen = {};
+  for (const c of state.cierres) {
+    const key = c.mes.slice(0, 7);
+    const prev = state.cierreSeen[key];
+    state.cierreSeen[key] = c.updated_at;
+    if (first || prev === c.updated_at) continue;
+    if (c.updated_by && c.updated_by !== myId && state.route === 'cierre' && key === cierreMes()) {
+      toast(`${memberById(c.updated_by)?.name || 'El otro'} actualizó el cierre`);
+    }
+  }
+}
+
+const cierreMes = () => state.routeArg || mesCierrePorDefecto(new Date());
+const cierreRow = (key) => state.cierres.find((c) => c.mes.slice(0, 7) === key) || null;
+const cierreVacio = (c) => !c || CIERRE_FIELDS.every((f) => !(c[f] || '').trim());
+
+let cierreSaving = null;
+
+/** Guarda lo escrito del mes: select ya hecho (state), insert si no existe, update si el insert da 23505. Nunca upsert. */
+async function saveCierre(key, manual) {
+  while (cierreSaving) { try { await cierreSaving; } catch (e) { /* ya avisó */ } }
+  const draft = state.cierreDraft[key];
+  const row = cierreRow(key);
+  const changes = {};
+  if (draft) for (const f of CIERRE_FIELDS) if (f in draft && draft[f] !== (row?.[f] ?? '')) changes[f] = draft[f];
+  if (!Object.keys(changes).length) {
+    if (draft) delete state.cierreDraft[key];
+    if (manual) toast('Guardado ✓');
+    return;
+  }
+  const run = async () => {
+    const mes = key + '-01';
+    let res;
+    if (!row) {
+      const full = {};
+      CIERRE_FIELDS.forEach((f) => { full[f] = changes[f] ?? ''; });
+      res = await write(() => state.client.from('cierres').insert({ mes, ...full }).select(CIERRE_COLS).single());
+      if (res.error?.code === '23505') res = null; // el otro lo creó justo antes: actualizar
+    }
+    if (!res) {
+      res = await write(() => state.client.from('cierres').update(changes).eq('mes', mes).select(CIERRE_COLS));
+      if (!res.error && res.data) res = { data: res.data[0], error: null };
+    }
+    if (res.error) throw res.error;
+    const saved = res.data;
+    if (saved) {
+      const i = state.cierres.findIndex((c) => c.mes === saved.mes);
+      if (i >= 0) state.cierres[i] = saved; else state.cierres.push(saved);
+      if (state.cierreSeen) state.cierreSeen[key] = saved.updated_at;
+    }
+    const d = state.cierreDraft[key];
+    if (d) {
+      for (const f of Object.keys(changes)) if (d[f] === changes[f]) delete d[f];
+      if (!Object.keys(d).length) delete state.cierreDraft[key];
+    }
+  };
+  cierreSaving = run();
+  try {
+    await cierreSaving;
+    if (manual) toast('Guardado ✓');
+  } catch (e) {
+    console.warn('cierre', e?.message);
+    toast('No se pudo guardar, probá de nuevo');
+  } finally {
+    cierreSaving = null;
+  }
+}
+
+const cierreAreaFocused = () => document.activeElement instanceof HTMLElement && document.activeElement.classList.contains('cierre-area');
+
 /* ============================== Tiempo real ============================= */
 
 let chSeq = 0;
@@ -247,15 +512,16 @@ async function subscribe() {
     if (state.phase !== 'ready') return;
     state.rt = 'CONNECTING';
     // Topic único por intento: channel() devuelve el canal viejo si el topic ya existe.
-    const ch = state.client
-      .channel('items-' + (++chSeq))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'items' }, () => refetch())
-      .subscribe((status) => {
-        if (ch !== state.channel) return; // estado de un canal ya descartado
-        state.rt = status;
-        if (status === 'SUBSCRIBED') refetch();
-        render();
-      });
+    const ch = state.client.channel('items-' + (++chSeq));
+    for (const table of ['items', 'gastos', 'mimos', 'cierres', 'actividad']) {
+      ch.on('postgres_changes', { event: '*', schema: 'public', table }, () => refetch());
+    }
+    ch.subscribe((status) => {
+      if (ch !== state.channel) return; // estado de un canal ya descartado
+      state.rt = status;
+      if (status === 'SUBSCRIBED') refetch();
+      render();
+    });
     state.channel = ch;
   } catch (e) {
     console.warn('subscribe', e?.message);
@@ -433,13 +699,13 @@ function openEditSheet(item) {
 }
 
 /** Confirmación propia (sin window.confirm). */
-function openConfirm(title, message, okLabel, onOk) {
+function openConfirm(title, message, okLabel, onOk, opts = {}) {
   openSheet(title, ({ close, focus }) => {
-    const ok = h('button', { class: 'btn danger', type: 'button' }, okLabel);
+    const ok = h('button', { class: opts.primary ? 'btn primary' : 'btn danger', type: 'button' }, okLabel);
     const no = h('button', { class: 'btn', type: 'button', onclick: close }, 'Cancelar');
     ok.addEventListener('click', async () => {
       ok.disabled = true;
-      try { await onOk(); close(); } catch (e) { console.warn('confirm', e?.message); toast('No se pudo borrar, probá de nuevo'); ok.disabled = false; }
+      try { await onOk(); close(); } catch (e) { console.warn('confirm', e?.message); toast(opts.errMsg || 'No se pudo borrar, probá de nuevo'); ok.disabled = false; }
     });
     focus(no);
     return h('div', { class: 'confirm' }, h('p', null, message), h('div', { class: 'row' }, ok, no));
@@ -684,7 +950,8 @@ function viewHome() {
         h('h1', { class: 'hello' }, `Hola, ${me()?.name || ''} 👋`),
         h('button', { class: 'btn ghost', type: 'button', onclick: signOut }, 'Salir')),
       liveLine()),
-    superCard, tasksCard);
+    mimoBanner(), superCard, tasksCard, gastosCard(), weekCard(), mimosCard(), cierreCard(),
+    h('a', { class: 'more-link soft', href: '#/cierre' }, 'Cierre del mes →'));
 }
 
 function viewSuper() {
@@ -699,7 +966,11 @@ function viewSuper() {
 
   const finish = h('button', {
     class: 'btn primary', type: 'button', disabled: done.length === 0,
-    onclick: () => openConfirm('Terminé la compra', `¿Sacar de la lista las ${done.length} cosas tildadas?`, 'Sí, sacarlas', () => deleteDone('super')),
+    onclick: () => openConfirm('Terminé la compra', `¿Sacar de la lista las ${done.length} cosas tildadas?`, 'Sí, sacarlas', async () => {
+      await deleteDone('super');
+      // Con el borrado ya hecho, preguntar (opcional) cuánto salió. Después de que se cierre esta hoja.
+      if (other()) setTimeout(() => openGastoSheet({ compra: true }), 0);
+    }),
   }, 'Terminé la compra ✓');
 
   const bar = h('i');
@@ -752,18 +1023,513 @@ function viewTareas() {
     doneSec);
 }
 
+/* ============================ Pantallas de v2 ============================ */
+
+const memberName = (id) => memberById(id)?.name || 'Alguien';
+const bothIds = () => { const a = me(), b = other(); return b ? [a.user_id, b.user_id] : [a.user_id]; };
+
+function topbar(title) {
+  return h('div', { class: 'topbar' }, h('button', { class: 'back', type: 'button', 'aria-label': 'Volver', onclick: goHome }, '←'), h('h1', null, title));
+}
+
+/** Torta de aportes (dona) con conic-gradient. Sin ganador: solo cómo se repartió. */
+function pieEl(porActor, size) {
+  const ids = bothIds();
+  const pct = porcentajes(porActor, ids);
+  const total = ids.reduce((s, id) => s + (porActor[id] || 0), 0);
+  const label = total ? ids.map((id, i) => `${memberName(id)} ${pct[i]} %`).join(', ') : 'Todavía sin aportes';
+  const el = h('div', { class: `pie ${size}`, role: 'img', 'aria-label': label });
+  if (!total) el.style.background = 'var(--soft)';
+  else if (ids.length === 1) el.style.background = colorOf(me());
+  else el.style.background = `conic-gradient(${colorOf(me())} 0 ${pct[0]}%, ${colorOf(other())} ${pct[0]}% 100%)`;
+  return el;
+}
+
+function pieLegend(porActor) {
+  const ids = bothIds();
+  const pct = porcentajes(porActor, ids);
+  const total = ids.reduce((s, id) => s + (porActor[id] || 0), 0);
+  return h('ul', { class: 'legend' }, ids.map((id, i) => {
+    const sw = h('span', { class: 'swatch', 'aria-hidden': 'true' });
+    sw.style.background = colorOf(memberById(id));
+    return h('li', null, sw, `${memberName(id)} ${total ? pct[i] : 0} %`);
+  }));
+}
+
+function aportesTabla(c) {
+  const ids = bothIds();
+  return h('table', { class: 'tabla' },
+    h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Aporte'), ids.map((id) => h('th', { scope: 'col' }, memberName(id))))),
+    h('tbody', null, TIPOS_APORTE.map(([tipo, nombre]) =>
+      h('tr', null, h('th', { scope: 'row' }, nombre), ids.map((id) => h('td', null, String(c.porTipo[tipo]?.[id] || 0)))))));
+}
+
+function aportesDe(per) { return contarAportes(state.actividad, per.start, per.end, bothIds()); }
+
+/* ---------- Inicio ---------- */
+
+function mimoBanner() {
+  const un = unseenForMe();
+  if (!un.length) return null;
+  const m = un[0], more = un.length - 1;
+  return h('button', { class: 'banner', type: 'button', onclick: () => { location.hash = '#/mimos'; } },
+    h('span', { class: 'banner-emoji', 'aria-hidden': 'true' }, MIMOS[m.tipo]?.emoji || '💌'),
+    h('span', { class: 'banner-text' }, `${mimoPhrase(m)} · ${timeAgo(m.created_at)}`, more > 0 && h('span', { class: 'banner-more' }, `y ${more} más`)));
+}
+
+function saldoLine(half) {
+  const c = saldoCents(half), on = other()?.name || 'el otro';
+  if (c === 0) return 'Están a mano ✓';
+  return c > 0 ? `${on} te debe ${fmtEUR(c)}` : `Le debés ${fmtEUR(-c)} a ${on}`;
+}
+const miSaldo = () => saldoHalf(state.gastos, me().user_id);
+
+function gastosCard() {
+  const o = other();
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-title' }, '💸 Gastos'),
+    o ? h('div', { class: 'saldo' }, saldoLine(miSaldo())) : h('div', { class: 'muted saldo-sub' }, 'Cuando entre la otra persona, van a poder repartir gastos.'),
+    h('div', { class: 'row card-actions' },
+      h('button', { class: 'btn primary', type: 'button', disabled: !o, onclick: () => openGastoSheet() }, 'Cargar gasto'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { location.hash = '#/gastos'; } }, 'Ver gastos →')));
+}
+
+function weekCard() {
+  const c = aportesDe(period('semana', 0));
+  return h('section', { class: 'card tap', onclick: () => { location.hash = '#/aportes'; } },
+    h('div', { class: 'card-title' }, '🥧 Esta semana'),
+    c.total
+      ? h('div', { class: 'pie-row' }, pieEl(c.porActor, 'sm'),
+        h('div', { class: 'pie-side' }, pieLegend(c.porActor), h('div', { class: 'muted' }, `${c.total} ${c.total === 1 ? 'aporte' : 'aportes'}`)))
+      : h('div', { class: 'preview' }, 'Todavía no hay aportes esta semana'),
+    c.total > 0 && h('div', { class: 'foot' }, 'Así se repartió la carga esta semana'),
+    h('a', { class: 'more-link', href: '#/aportes' }, 'Ver aportes →'));
+}
+
+function mimosCard() {
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-title' }, '💌 Mimos'),
+    mimoButtons(),
+    !other() && h('p', { class: 'muted small' }, 'Cuando entre la otra persona, van a poder mandarse mimos.'),
+    h('a', { class: 'more-link', href: '#/mimos' }, 'Ver mimos →'));
+}
+
+function cierreCard() {
+  const key = mesFindeDeCierre(new Date());
+  if (!key || !cierreVacio(cierreRow(key))) return null;
+  return h('section', { class: 'card tap cierre-card', onclick: () => { location.hash = `#/cierre/${key}`; } },
+    h('p', null, `🗓️ Es finde de cierre de ${monthName(key)}. ¿Se hacen un rato para charlarlo?`),
+    h('a', { class: 'more-link', href: `#/cierre/${key}` }, 'Ir al cierre →'));
+}
+
+/* ---------- Mimos ---------- */
+
+async function quickMimo(tipo) {
+  if (state.sendingMimo) return;
+  state.sendingMimo = true;
+  try {
+    await sendMimo(tipo);
+    const o = other();
+    toast(tipo === 'beso' ? `Le mandaste un beso a ${o.name} 💋` : `Le mandaste un corazón a ${o.name} ❤️`);
+  } catch (e) {
+    console.warn('mimo', e?.message);
+    toast('No se pudo mandar, probá de nuevo');
+  } finally { state.sendingMimo = false; }
+}
+
+function mimoButtons() {
+  const o = other();
+  const mk = (tipo, onclick) => h('button', { class: 'mimo-btn', type: 'button', disabled: !o, 'aria-label': MIMOS[tipo].name, onclick },
+    h('span', { class: 'mimo-emoji', 'aria-hidden': 'true' }, MIMOS[tipo].emoji), h('span', { class: 'mimo-name' }, MIMOS[tipo].name));
+  return h('div', { class: 'mimo-grid' },
+    mk('corazon', () => quickMimo('corazon')), mk('beso', () => quickMimo('beso')),
+    mk('gracias', openGraciasSheet), mk('vale', openValeSheet));
+}
+
+function openGraciasSheet() {
+  const o = other();
+  if (!o) return;
+  let busy = false;
+  openSheet('Gracias 🙏', ({ close, focus }) => {
+    const input = h('input', { class: 'input', type: 'text', maxlength: 80, placeholder: `Un mensaje para ${o.name} (opcional)`, 'aria-label': 'Mensaje', enterkeyhint: 'send', autocomplete: 'off' });
+    const send = h('button', { class: 'btn primary block', type: 'button' }, 'Mandar 🙏');
+    send.addEventListener('click', async () => {
+      if (busy) return;
+      const raw = input.value.trim();
+      if (raw.length > 80) { input.focus(); return; }
+      busy = true; send.disabled = true;
+      try {
+        await sendMimo('gracias', raw || null);
+        close();
+        toast(`Le diste las gracias a ${o.name} 🙏`);
+      } catch (e) { console.warn('gracias', e?.message); toast('No se pudo mandar, probá de nuevo'); busy = false; send.disabled = false; }
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); send.click(); } });
+    focus(input);
+    return h('div', { class: 'stack' }, h('p', { class: 'muted' }, `¿Qué le agradecés a ${o.name}?`), input, send);
+  });
+}
+
+function openValeSheet() {
+  const o = other();
+  if (!o) return;
+  let busy = false;
+  const give = async (texto, close, btns) => {
+    if (busy) return;
+    busy = true; btns.forEach((b) => { b.disabled = true; });
+    try {
+      await sendMimo('vale', texto);
+      close();
+      toast(`Le regalaste "${texto}" a ${o.name} 🎁`);
+    } catch (e) { console.warn('vale', e?.message); toast('No se pudo mandar, probá de nuevo'); busy = false; btns.forEach((b) => { b.disabled = false; }); }
+  };
+  openSheet('Un vale 🎁', ({ close, focus }) => {
+    const btns = [];
+    const presets = VALES.map((t) => { const b = h('button', { class: 'btn block vale-opt', type: 'button', onclick: () => give(t, close, btns) }, t); btns.push(b); return b; });
+    const input = h('input', { class: 'input', type: 'text', maxlength: 80, placeholder: 'Vale por…', 'aria-label': 'Vale por', enterkeyhint: 'send', autocomplete: 'off' });
+    const send = h('button', { class: 'btn primary block', type: 'button' }, 'Regalar');
+    btns.push(send);
+    const custom = h('div', { class: 'stack' }, input, send);
+    custom.hidden = true;
+    const other_ = h('button', { class: 'btn ghost block', type: 'button' }, 'Escribir otro…');
+    other_.addEventListener('click', () => { custom.hidden = false; other_.hidden = true; input.focus(); });
+    const go = () => { const t = cleanText(input.value, 80); if (!t) { input.focus(); return; } give(t, close, btns); };
+    send.addEventListener('click', go);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    focus(presets[0]);
+    return h('div', { class: 'stack' }, h('p', { class: 'muted' }, `Un vale para ${o.name}. Lo puede canjear cuando quiera.`), ...presets, other_, custom);
+  });
+}
+
+function viewMimos() {
+  const o = other(), myId = me().user_id;
+  const byNew = (a, b) => new Date(b.created_at) - new Date(a.created_at);
+  const recibidos = state.mimos.filter((m) => m.para === myId).sort(byNew);
+  const valesPend = recibidos.filter((m) => m.tipo === 'vale' && !m.canjeado);
+  const resto = recibidos.filter((m) => !(m.tipo === 'vale' && !m.canjeado));
+  const enviados = state.mimos.filter((m) => m.de === myId).sort(byNew);
+
+  const recRow = (m) => {
+    const sub = m.canjeado ? `canjeado ${timeAgo(m.canjeado_at || m.created_at)} · ${timeAgo(m.created_at)}` : timeAgo(m.created_at);
+    return h('li', { class: `mimo-row${m.tipo === 'vale' && !m.canjeado ? ' vale' : ''}${m.canjeado ? ' used' : ''}${state.freshMimos.has(m.id) ? ' fresh' : ''}` },
+      h('span', { class: 'mimo-big', 'aria-hidden': 'true' }, MIMOS[m.tipo]?.emoji || '💌'),
+      h('div', { class: 'mimo-body' },
+        h('div', { class: 'mimo-title' }, mimoPhrase(m), state.freshMimos.has(m.id) && h('span', { class: 'tag' }, 'nuevo')),
+        h('div', { class: 'muted small' }, sub)),
+      m.tipo === 'vale' && !m.canjeado && h('button', { class: 'btn primary', type: 'button', onclick: () => canjearMimo(m) }, 'Canjear'));
+  };
+
+  const estado = (m) => (m.canjeado ? 'canjeado' : m.visto ? 'visto' : 'sin ver');
+  const sentText = (m) => {
+    if (m.tipo === 'corazon') return 'Un corazón';
+    if (m.tipo === 'beso') return 'Un beso';
+    if (m.tipo === 'gracias') return m.texto ? `Gracias: ${m.texto}` : 'Gracias';
+    return m.texto;
+  };
+  const sentRow = (m) => h('li', { class: 'mimo-row sent' },
+    h('span', { class: 'mimo-big', 'aria-hidden': 'true' }, MIMOS[m.tipo]?.emoji || '💌'),
+    h('div', { class: 'mimo-body' },
+      h('div', { class: 'mimo-title' }, sentText(m)),
+      h('div', { class: 'muted small' }, `${estado(m)} · ${timeAgo(m.created_at)}`)),
+    h('button', {
+      class: 'btn ghost', type: 'button', 'aria-label': `Deshacer: ${sentText(m)}`,
+      onclick: () => openConfirm('Deshacer mimo', '¿Querés sacar este mimo? Si ya lo vio, igual desaparece.', 'Sí, sacarlo', () => deleteMimo(m), { errMsg: 'No se pudo deshacer, probá de nuevo' }),
+    }, 'Deshacer'));
+
+  return h('div', { class: 'stack' },
+    topbar('Mimos 💌'),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-title' }, o ? `Mandale algo a ${o.name}` : 'Mandar un mimo'),
+      mimoButtons(),
+      !o && h('p', { class: 'muted small' }, 'Cuando entre la otra persona, van a poder mandarse mimos.')),
+    h('section', { class: 'group' },
+      h('h2', null, 'Para vos'),
+      recibidos.length
+        ? h('ul', { class: 'list' }, valesPend.map(recRow), resto.map(recRow))
+        : h('p', { class: 'muted pad' }, 'Todavía no llegó ninguno. Mandá el primero 😉')),
+    enviados.length > 0 && h('section', { class: 'group' },
+      h('h2', null, 'Los que mandaste'),
+      h('ul', { class: 'list' }, enviados.map(sentRow))));
+}
+
+/* ---------- Gastos ---------- */
+
+function openGastoSheet(opts = {}) {
+  const g = opts.gasto || null;
+  const compra = !!opts.compra;
+  const isPago = g?.tipo === 'pago';
+  const mi = me(), ot = other();
+  if (!ot) { toast('Falta que entre la otra persona'); return; }
+  const f = { payer: g ? g.pagado_por : mi.user_id, reparto: g ? g.reparto : 'mitad', busy: false, confirming: false };
+  const title = compra ? '¿Cuánto salió la compra?' : g ? (isPago ? 'Editar pago' : 'Editar gasto') : 'Cargar gasto';
+  openSheet(title, ({ close, focus }) => {
+    const desc = h('input', { class: 'input', type: 'text', maxlength: 80, value: g ? g.descripcion : '', placeholder: 'Qué compraste o pagaste', 'aria-label': 'Descripción', autocomplete: 'off' });
+    const amount = h('input', { class: 'input', type: 'text', inputmode: 'decimal', value: g ? centsToInput(g.monto_cent) : '', placeholder: '0,00', 'aria-label': 'Importe en euros', autocomplete: 'off' });
+    const date = h('input', { class: 'input', type: 'date', value: g ? g.fecha : todayISO(), 'aria-label': 'Fecha' });
+    const err = h('div', { class: 'form-error', role: 'alert' });
+    const repBox = h('div');
+    const paintRep = () => {
+      const noPaga = f.payer === mi.user_id ? ot.name : mi.name;
+      repBox.replaceChildren(h('div', { class: 'label' }, '¿Para quién?'),
+        segmented([['mitad', 'Para los dos (mitad)'], ['todo_otro', `Todo para ${noPaga}`]], () => f.reparto, (v) => { f.reparto = v; }, 'Para quién'));
+    };
+    paintRep();
+    const payerSeg = segmented([[mi.user_id, 'Yo'], [ot.user_id, ot.name]], () => f.payer, (v) => { f.payer = v; paintRep(); }, 'Quién pagó');
+    const save = h('button', { class: 'btn primary block', type: 'button' }, compra ? 'Guardar gasto' : 'Guardar');
+    const delArea = h('div', { class: 'confirm' });
+
+    const submit = async () => {
+      if (f.busy) return;
+      const cents = parseEuros(amount.value);
+      const d = compra ? 'Compra del súper' : cleanText(desc.value, 80);
+      const fecha = compra ? todayISO() : date.value;
+      if (!d) { err.textContent = 'Poné una descripción (hasta 80 letras).'; desc.focus(); return; }
+      if (cents === null) { err.textContent = 'Poné un importe válido, por ejemplo 23,40 (hasta 100000).'; amount.focus(); return; }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) { err.textContent = 'Poné una fecha válida.'; date.focus(); return; }
+      err.textContent = '';
+      f.busy = true; save.disabled = true;
+      try {
+        if (g) {
+          const ch = { descripcion: d, monto_cent: cents, pagado_por: f.payer, fecha };
+          if (!isPago) ch.reparto = f.reparto;
+          await updateGasto(g, ch);
+        } else {
+          await insertGasto({ tipo: 'gasto', descripcion: d, monto_cent: cents, pagado_por: f.payer, reparto: compra ? 'mitad' : f.reparto, fecha });
+        }
+        close();
+        toast(g ? 'Cambios guardados ✓' : 'Gasto guardado ✓');
+      } catch (e) {
+        console.warn('gasto', e?.message);
+        const gone = e?.message === 'missing';
+        toast(gone ? 'Esto ya no existe' : 'No se pudo guardar, probá de nuevo');
+        if (gone) { close(); refetch(); }
+        f.busy = false; save.disabled = false;
+      }
+    };
+    save.addEventListener('click', submit);
+    [desc, amount].forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } }));
+
+    const paintDel = () => {
+      delArea.replaceChildren();
+      if (!g) return;
+      if (!f.confirming) {
+        delArea.appendChild(h('button', { class: 'btn danger block', type: 'button', onclick: () => { f.confirming = true; paintDel(); } }, 'Borrar'));
+      } else {
+        delArea.appendChild(h('p', null, '¿Seguro?'));
+        delArea.appendChild(h('div', { class: 'row' },
+          h('button', { class: 'btn danger', type: 'button', onclick: async () => {
+            if (f.busy) return;
+            f.busy = true;
+            try { await deleteGasto(g); close(); } catch (e) { console.warn('del', e?.message); toast('No se pudo borrar, probá de nuevo'); f.busy = false; }
+          } }, 'Sí, borrar'),
+          h('button', { class: 'btn', type: 'button', onclick: () => { f.confirming = false; paintDel(); } }, 'No')));
+      }
+    };
+    paintDel();
+    focus(compra || g ? amount : desc);
+    return h('div', { class: 'stack' },
+      !compra && h('div', null, h('div', { class: 'label' }, 'Descripción'), desc),
+      h('div', null, h('div', { class: 'label' }, 'Importe (€)'), amount),
+      h('div', null, h('div', { class: 'label' }, '¿Quién pagó?'), payerSeg),
+      !compra && !isPago && repBox,
+      !compra && h('div', null, h('div', { class: 'label' }, 'Fecha'), date),
+      err, save,
+      compra && h('button', { class: 'btn ghost block', type: 'button', onclick: close }, 'Ahora no'),
+      delArea);
+  });
+}
+
+function openSaldar() {
+  const half = miSaldo(), c = saldoCents(half);
+  if (c === 0) return;
+  const deudor = c > 0 ? other() : me(), acreedor = c > 0 ? me() : other();
+  const monto = Math.abs(c);
+  openConfirm('Saldar cuentas', `¿${deudor.name} le pagó ${fmtEUR(monto)} a ${acreedor.name}?`, 'Sí, saldar', async () => {
+    await insertGasto({ tipo: 'pago', descripcion: 'Saldaron cuentas', monto_cent: monto, pagado_por: deudor.user_id, reparto: 'todo_otro', fecha: todayISO() });
+    toast('Cuentas saldadas ✓');
+  }, { primary: true, errMsg: 'No se pudo guardar, probá de nuevo' });
+}
+
+function viewGastos() {
+  const o = other();
+  const c = saldoCents(miSaldo());
+  const sorted = [...state.gastos].sort((a, b) => (a.fecha === b.fecha ? new Date(b.created_at) - new Date(a.created_at) : a.fecha < b.fecha ? 1 : -1));
+  const months = [];
+  sorted.forEach((g) => {
+    const k = g.fecha.slice(0, 7);
+    let grp = months[months.length - 1];
+    if (!grp || grp.key !== k) { grp = { key: k, rows: [] }; months.push(grp); }
+    grp.rows.push(g);
+  });
+
+  const row = (g) => {
+    const pagador = memberName(g.pagado_por);
+    const otroN = memberName(bothIds().find((id) => id !== g.pagado_por) || g.pagado_por);
+    const isPago = g.tipo === 'pago';
+    const title = isPago ? `${pagador} le pagó a ${otroN}` : g.descripcion;
+    const sub = isPago ? `${fechaCorta(g.fecha)} · ${g.descripcion}`
+      : `${fechaCorta(g.fecha)} · pagó ${pagador} · ${g.reparto === 'mitad' ? 'mitad' : `todo para ${otroN}`}`;
+    return h('li', { class: `gasto-row${isPago ? ' pago' : ''}` },
+      h('div', { class: 'g-main' }, h('div', { class: 'g-title' }, title), h('div', { class: 'muted small' }, sub)),
+      h('div', { class: 'g-amount' }, fmtEUR(g.monto_cent)),
+      h('button', { class: 'more', type: 'button', 'aria-label': `Editar ${title}`, onclick: () => openGastoSheet({ gasto: g }) }, '⋯'));
+  };
+
+  const groups = months.map((grp) => {
+    const rs = resumenGastosMes(state.gastos, grp.key);
+    const parts = bothIds().map((id) => `pagó ${memberName(id)} ${fmtEUR(rs.porPagador[id] || 0)}`);
+    return h('section', { class: 'group' },
+      h('h2', null, cap(monthLabel(grp.key))),
+      h('p', { class: 'muted small month-sum' }, rs.n
+        ? `${cap(monthName(grp.key))}: gastaron ${fmtEUR(rs.total)} entre los dos · ${parts.join(' · ')}`
+        : `${cap(monthName(grp.key))}: sin gastos, solo pagos`),
+      h('div', { class: 'card' }, h('ul', { class: 'list tight' }, grp.rows.map(row))));
+  });
+
+  return h('div', { class: 'stack' },
+    topbar('Gastos 💸'),
+    h('section', { class: 'card' },
+      o ? h('div', { class: 'saldo big-saldo' }, saldoLine(miSaldo())) : h('p', { class: 'muted' }, 'Cuando entre la otra persona, van a poder repartir gastos.'),
+      h('div', { class: 'row card-actions' },
+        c !== 0 && h('button', { class: 'btn', type: 'button', onclick: openSaldar }, 'Saldar'),
+        h('button', { class: 'btn primary', type: 'button', disabled: !o, onclick: () => openGastoSheet() }, 'Cargar gasto'))),
+    months.length ? groups : h('p', { class: 'nothing' }, 'Todavía no hay gastos'));
+}
+
+/* ---------- Aportes ---------- */
+
+function periodNav(label, canPrev, canNext, onPrev, onNext) {
+  return h('div', { class: 'period-nav' },
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Anterior', disabled: !canPrev, onclick: onPrev }, '‹'),
+    h('div', { class: 'period-label' }, label),
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Siguiente', disabled: !canNext, onclick: onNext }, '›'));
+}
+
+function earliestAt() {
+  let min = Infinity;
+  for (const a of state.actividad) { const t = new Date(a.at).getTime(); if (t < min) min = t; }
+  return min;
+}
+
+function viewAportes() {
+  const per = period(state.apKind, state.apOffset);
+  const c = aportesDe(per);
+  const canPrev = earliestAt() < per.start.getTime();
+  const seg = segmented([['semana', 'Semana'], ['mes', 'Mes']], () => state.apKind, (v) => { state.apKind = v; state.apOffset = 0; render(); }, 'Período');
+  return h('div', { class: 'stack' },
+    topbar('Aportes 🥧'),
+    seg,
+    periodNav(per.label, canPrev, state.apOffset > 0, () => { state.apOffset++; render(); }, () => { state.apOffset--; render(); }),
+    h('section', { class: 'card pie-card' },
+      pieEl(c.porActor, 'lg'),
+      pieLegend(c.porActor),
+      h('p', { class: 'muted' }, c.total ? `${c.total} ${c.total === 1 ? 'aporte' : 'aportes'} · así se repartió la carga` : 'Sin aportes en este período'),
+      aportesTabla(c)),
+    h('p', { class: 'muted small center' }, 'Cuenta desde que existe el historial. Agregar, tildar, cargar gastos y mandar mimos suman por igual.'));
+}
+
+/* ---------- Cierre del mes ---------- */
+
+function earliestMonthKey() {
+  let min = null;
+  const eat = (k) => { if (k && (min === null || k < min)) min = k; };
+  state.gastos.forEach((g) => eat(g.fecha.slice(0, 7)));
+  state.mimos.forEach((m) => eat(monthKey(new Date(m.created_at))));
+  state.actividad.forEach((a) => eat(monthKey(new Date(a.at))));
+  state.cierres.forEach((c) => eat(c.mes.slice(0, 7)));
+  return min;
+}
+
+function viewCierre() {
+  const key = cierreMes(), nowKey = monthKey(new Date());
+  const row = cierreRow(key);
+  const draft = state.cierreDraft[key] || {};
+  const ids = bothIds();
+  const earliest = earliestMonthKey();
+  const go = (k) => { location.hash = `#/cierre/${k}`; };
+
+  // Aportes del mes
+  const offset = (() => { const a = nowKey.split('-').map(Number), b = key.split('-').map(Number); return (a[0] - b[0]) * 12 + (a[1] - b[1]); })();
+  const per = period('mes', offset);
+  const c = aportesDe(per);
+  const aportes = h('section', { class: 'card pie-card' },
+    h('div', { class: 'card-title' }, '🥧 Cómo se repartió la carga'),
+    pieEl(c.porActor, 'lg'), pieLegend(c.porActor),
+    h('p', { class: 'muted' }, c.total ? `${c.total} ${c.total === 1 ? 'aporte' : 'aportes'}` : 'Sin aportes registrados este mes'),
+    aportesTabla(c));
+
+  // Gastos del mes
+  const rs = resumenGastosMes(state.gastos, key);
+  const saldoCierre = saldoHalf(state.gastos, me().user_id, lastDayOfMonth(key));
+  const gastos = h('section', { class: 'card' },
+    h('div', { class: 'card-title' }, '💸 Gastos'),
+    rs.n
+      ? h('div', { class: 'stack tight-stack' },
+        h('p', null, `Gastaron ${fmtEUR(rs.total)} entre los dos.`),
+        h('p', { class: 'muted' }, ids.map((id) => `Pagó ${memberName(id)} ${fmtEUR(rs.porPagador[id] || 0)}`).join(' · ')))
+      : h('p', { class: 'muted' }, 'No hubo gastos este mes.'),
+    other() && h('p', { class: 'saldo-sub' }, `Saldo al cierre del mes: ${saldoLine(saldoCierre)}`));
+
+  // Mimos del mes
+  const myId = me().user_id;
+  const delMes = state.mimos.filter((m) => monthKey(new Date(m.created_at)) === key);
+  const canjMes = state.mimos.filter((m) => m.canjeado && m.canjeado_at && monthKey(new Date(m.canjeado_at)) === key).length;
+  const mimos = h('section', { class: 'card' },
+    h('div', { class: 'card-title' }, '💌 Mimos'),
+    delMes.length || canjMes
+      ? h('ul', { class: 'mimo-count' },
+        Object.keys(MIMOS).map((t) => {
+          const mand = delMes.filter((m) => m.tipo === t && m.de === myId).length;
+          const rec = delMes.filter((m) => m.tipo === t && m.para === myId).length;
+          return h('li', null, h('span', { 'aria-hidden': 'true' }, MIMOS[t].emoji), ` ${MIMOS[t].name}: mandaste ${mand} · recibiste ${rec}`);
+        }),
+        h('li', null, `🎟️ Vales canjeados: ${canjMes}`))
+      : h('p', { class: 'muted' }, 'No hubo mimos este mes. Todavía están a tiempo 😉'));
+
+  // Preguntas compartidas
+  const areas = CIERRE_Q.map(([f, q]) => {
+    const ta = h('textarea', { class: 'input cierre-area', rows: 4, maxlength: 2000, 'data-campo': f, 'aria-label': q, placeholder: 'Lo que se les ocurra, sin apuro', value: draft[f] ?? row?.[f] ?? '' });
+    ta.addEventListener('input', () => { (state.cierreDraft[key] = state.cierreDraft[key] || {})[f] = ta.value; });
+    ta.addEventListener('blur', async () => {
+      await saveCierre(key);
+      setTimeout(() => { if (!cierreAreaFocused()) render(); }, 0);
+    });
+    return h('div', { class: 'field' }, h('label', { class: 'q' }, q, ta));
+  });
+  const pendiente = Object.keys(draft).length > 0;
+  const status = h('p', { class: 'muted small', 'aria-live': 'polite' },
+    pendiente ? 'Sin guardar todavía' : row ? `Guardado · lo editó ${memberName(row.updated_by)} ${timeAgo(row.updated_at)}` : 'Todavía no escribieron nada');
+  const saveBtn = h('button', { class: 'btn primary block', type: 'button' }, 'Guardar');
+  saveBtn.addEventListener('click', async () => { saveBtn.disabled = true; await saveCierre(key, true); render(); });
+  const preguntas = h('section', { class: 'card stack' },
+    h('div', { class: 'card-title' }, '🗣️ Para charlar juntos'), ...areas, status, saveBtn);
+
+  return h('div', { class: 'stack' },
+    topbar(`Cierre de ${monthLabel(key)}`),
+    periodNav(cap(monthLabel(key)), !!earliest && key > earliest, key < nowKey, () => go(addMonthKey(key, -1)), () => go(addMonthKey(key, 1))),
+    h('p', { class: 'muted' }, 'Un ratito para mirar el mes y charlarlo, sin examen ni culpas: qué aprendimos, qué mejoramos y en qué seguimos trabajando. Escriban acá lo que se llevan de la charla.'),
+    aportes, gastos, mimos, preguntas);
+}
+
 /* ============================== Render y ruteo ========================== */
 
 function goHome() { location.replace('#/'); } // sin apilar otra entrada en el historial
 
 function parseRoute() {
   const r = location.hash.replace(/^#\/?/, '');
-  state.route = r === 'super' ? 'super' : r === 'tareas' ? 'tareas' : 'home';
+  const [a, b] = r.split('/');
+  state.route = ROUTES.includes(a) ? a : 'home';
+  state.routeArg = state.route === 'cierre' && /^\d{4}-(0[1-9]|1[0-2])$/.test(b || '') ? b : null;
 }
+
+const VIEWS = { home: viewHome, super: viewSuper, tareas: viewTareas, gastos: viewGastos, aportes: viewAportes, mimos: viewMimos, cierre: viewCierre };
 
 function render() {
   const app = document.getElementById('app');
   const ready = state.phase === 'ready';
+  // Escribiendo en el cierre: no repintar (se repinta al salir del campo).
+  if (ready && state.loaded && state.route === 'cierre' && cierreAreaFocused()) return;
+  if (ready && state.loaded) ensureSeen(); // antes de pintar, para resaltar los nuevos
   const old = app.firstElementChild;
   // Si se está tipeando en el input rápido del súper, repintar todo menos ese input.
   const partial = ready && state.loaded && state.route === 'super' && !!old && old.dataset.view === 'super'
@@ -777,7 +1543,7 @@ function render() {
   else if (state.phase === 'waiting') view = viewWaiting();
   else if (state.phase === 'error') view = viewError();
   else if (ready && !state.loaded) view = viewLoading();
-  else if (ready) view = state.route === 'super' ? viewSuper() : state.route === 'tareas' ? viewTareas() : viewHome();
+  else if (ready) view = VIEWS[state.route]();
   else view = h('p', { class: 'boot' }, 'Cargando…');
   keepQuick = false;
 
@@ -795,7 +1561,7 @@ function render() {
   app.replaceChildren(view);
   document.body.classList.toggle('has-finish', ready && state.loaded && state.route === 'super');
 
-  if (ready && state.loaded) {
+  if (ready && state.loaded && ['home', 'super', 'tareas'].includes(state.route)) {
     app.appendChild(h('button', {
       class: 'fab', type: 'button', 'aria-label': 'Agregar',
       onclick: () => openAddSheet(state.route === 'tareas' ? 'tareas' : 'super'),
@@ -855,6 +1621,9 @@ function onAuth(session) {
     enterGen++; // cancela cualquier carga en curso
     unsubscribe();
     state.members = []; state.items = [];
+    state.gastos = []; state.mimos = []; state.actividad = []; state.cierres = [];
+    state.mimosInit = false; state.seenMimos = new Set(); state.freshMimos = new Set();
+    state.cierreDraft = {}; state.cierreSeen = null;
     state.loaded = false; state.loadFailed = false; state.dirty = false;
     quickUI.input.value = '';
     state.phase = 'auth';
@@ -891,9 +1660,18 @@ function boot() {
     setTimeout(() => onAuth(session), 0);
   });
 
-  window.addEventListener('hashchange', () => { closeSheet(); parseRoute(); render(); window.scrollTo(0, 0); });
+  window.addEventListener('hashchange', () => {
+    const prev = state.route === 'cierre' ? cierreMes() : null;
+    if (prev && state.cierreDraft[prev]) saveCierre(prev); // no perder lo escrito al irse de la pantalla
+    closeSheet(); parseRoute();
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur(); // si no, render() ignora el cambio con un textarea del cierre enfocado
+    state.freshMimos = new Set(); render(); window.scrollTo(0, 0);
+  });
   window.addEventListener('online', resync);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') resync(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resync();
+    else if (state.route === 'cierre' && state.cierreDraft[cierreMes()]) saveCierre(cierreMes());
+  });
   window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
   setInterval(() => { if (document.visibilityState === 'visible') resync(); }, 60000);
 }

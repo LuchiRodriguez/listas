@@ -245,3 +245,96 @@ h1 { font-size: 28px; line-height: 1.2; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ==================== v2: convivencia ==================== */
+.small { font-size: 14px; }
+.center { text-align: center; }
+.pad { padding: 8px 2px; }
+button, input, textarea { font: inherit; color: inherit; }
+textarea.input { resize: vertical; min-height: 110px; line-height: 1.4; font-size: 16px; }
+.input[type="date"] { -webkit-appearance: none; appearance: none; min-width: 0; text-align: left; }
+.more-link.soft { align-self: center; color: var(--muted); font-weight: 600; }
+.card-actions { margin-top: 12px; }
+.card-actions > .btn { padding-left: 10px; padding-right: 10px; }
+.tight-stack { gap: 6px; }
+.list.tight { gap: 0; }
+
+/* Banner de mimos */
+.banner {
+  display: flex; align-items: center; gap: 12px; width: 100%; min-height: 60px; text-align: left;
+  padding: 10px 14px; background: var(--accent); color: var(--accent-ink);
+  border: 2px solid #2b2b2b; border-radius: var(--radius); box-shadow: var(--shadow); font-weight: 700;
+}
+.banner:active { transform: translate(1px, 2px); box-shadow: none; }
+.banner-emoji { font-size: 30px; line-height: 1; flex: none; }
+.banner-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.banner-more { display: block; font-weight: 600; font-size: 14px; opacity: .75; }
+
+/* Gastos */
+.saldo { font-size: 24px; font-weight: 800; line-height: 1.2; margin: 8px 0 0; overflow-wrap: anywhere; }
+.big-saldo { font-size: 30px; }
+.saldo-sub { font-weight: 600; }
+.month-sum { margin-bottom: 6px; }
+.gasto-row { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 6px 0; }
+.gasto-row + .gasto-row { border-top: 1px solid var(--soft); }
+.g-main { flex: 1; min-width: 0; }
+.g-title { font-weight: 600; overflow-wrap: anywhere; }
+.g-amount { font-weight: 800; white-space: nowrap; }
+.gasto-row.pago .g-title { color: var(--ok); }
+
+/* Torta de aportes (dona) */
+.pie {
+  position: relative; border-radius: 50%; border: 2px solid var(--line); flex: none;
+  background: var(--soft);
+}
+.pie::after {
+  content: ""; position: absolute; inset: 27%; border-radius: 50%;
+  background: var(--card); border: 2px solid var(--line);
+}
+.pie.sm { width: 96px; height: 96px; }
+.pie.lg { width: 200px; height: 200px; }
+.pie-row { display: flex; align-items: center; gap: 16px; margin: 10px 0 0; }
+.pie-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.pie-card { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; }
+.pie-card .card-title { align-self: stretch; }
+.legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; font-weight: 700; justify-content: center; }
+.pie-side .legend { flex-direction: column; justify-content: flex-start; }
+.swatch { display: inline-block; width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid #2b2b2b; margin-right: 6px; vertical-align: -1px; }
+.tabla { width: 100%; border-collapse: collapse; font-size: 15px; text-align: left; }
+.tabla th, .tabla td { padding: 8px 6px; border-top: 1px solid var(--soft); font-weight: 500; }
+.tabla thead th { border-top: 0; color: var(--muted); font-size: 13px; font-weight: 700; }
+.tabla td, .tabla thead th:not(:first-child) { text-align: right; width: 22%; }
+.period-nav { display: flex; align-items: center; gap: 10px; }
+.period-nav .btn { width: 52px; padding: 0; font-size: 24px; flex: none; }
+.period-label { flex: 1; text-align: center; font-weight: 700; font-size: 17px; }
+
+/* Mimos */
+.mimo-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+.mimo-btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+  min-height: 72px; padding: 6px 2px; background: var(--card); border: 2px solid var(--line); border-radius: 16px;
+  box-shadow: 2px 3px 0 rgba(43, 43, 43, .14);
+}
+.mimo-btn:active:not(:disabled) { transform: translate(1px, 2px); box-shadow: none; }
+.mimo-btn:disabled { opacity: .5; cursor: not-allowed; }
+.mimo-emoji { font-size: 32px; line-height: 1.1; }
+.mimo-name { font-size: 13px; font-weight: 700; color: var(--ink); }
+.mimo-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--card); border: 2px solid var(--line); border-radius: 16px; min-height: 64px; }
+.mimo-row.vale { background: var(--accent); color: var(--accent-ink); border-color: #2b2b2b; box-shadow: var(--shadow); }
+.mimo-row.vale .muted { color: #5a5238; }
+.mimo-row.used { opacity: .6; }
+.mimo-row.fresh { border-color: var(--ok); }
+.mimo-big { font-size: 30px; line-height: 1; flex: none; }
+.mimo-body { flex: 1; min-width: 0; }
+.mimo-title { font-weight: 600; overflow-wrap: anywhere; }
+.tag { margin-left: 8px; padding: 1px 8px; border-radius: 99px; background: var(--ok); color: #fff; font-size: 12px; font-weight: 700; vertical-align: 2px; }
+.mimo-count { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.vale-opt { text-align: left; }
+.toast.big { display: flex; align-items: center; gap: 12px; padding: 14px 18px; font-size: 17px; font-weight: 600; border: 2px solid var(--accent); }
+.toast-emoji { font-size: 34px; line-height: 1; flex: none; }
+
+/* Cierre */
+.cierre-card { background: var(--accent); color: var(--accent-ink); border-color: #2b2b2b; font-weight: 600; }
+.cierre-card .more-link { color: var(--accent-ink); }
+label.q { font-size: 16px; font-weight: 700; color: var(--ink); display: flex; flex-direction: column; gap: 6px; }
+.field label.q { font-size: 16px; color: var(--ink); }

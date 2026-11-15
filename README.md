@@ -10,6 +10,8 @@ Lista de súper y de tareas compartida entre dos personas, en vivo desde el móv
 - `manifest.webmanifest`, `icons/`: PWA.
 - `supabase/schema.sql`: tablas, RLS, privilegios por columna, triggers y realtime.
 - `supabase/test_rls.sql`: pruebas de las políticas.
+- `calc.js`: cálculos puros de v2 (plata, semanas, meses, aportes). Módulo ES importado por `app.js`.
+- `supabase/v2.sql` y `supabase/test_v2.sql`: migración y pruebas de v2.
 
 ## Configurar Supabase
 
@@ -59,3 +61,20 @@ Settings → Pages → desplegar desde la rama principal, carpeta raíz. `.nojek
 - CSP estricta: `script-src 'self'`, sin inline, `connect-src` limitado a tu proyecto de Supabase, `form-action 'none'`, `base-uri 'none'`. Referrer desactivado.
 - Todo texto de usuario se pinta con `textContent`/nodos de texto; no se usa `innerHTML`.
 - No pongas nunca la clave `service_role` en este repo.
+
+## v2: convivencia
+
+Además de las listas, la app ahora tiene:
+
+- **Gastos** (#/gastos): estilo Splitwise, en euros. Cada gasto es mitad y mitad o "todo para el otro". Arriba se ve el saldo ("Mati te debe 23,40 €") y el botón Saldar registra un pago. Al tocar "Terminé la compra" en el súper pregunta, opcionalmente, cuánto salió y quién pagó, y lo carga como "Compra del súper".
+- **Aportes** (#/aportes): torta semanal o mensual de cuánto aportó cada uno (agregar al súper, crear y completar tareas, hacer la compra, cargar gastos, mimos). Sin ganador: solo cómo se reparte la carga. La semana va de lunes a domingo en hora local del móvil.
+- **Mimos** (#/mimos): corazón, beso, gracias (con mensaje) y vales canjeables. Avisan dentro de la app (aviso especial si está abierta, banner en el inicio si hay sin ver). No hay push ni service worker.
+- **Cierre de mes** (#/cierre, #/cierre/AAAA-MM): resumen del mes y tres preguntas compartidas para charlar juntos (qué aprendimos, qué mejoramos, en qué seguimos trabajando).
+
+### Aplicar v2
+
+1. v1 tiene que estar aplicada (`supabase/schema.sql`).
+2. En el SQL Editor pegá `supabase/v2.sql` entero. Es idempotente.
+3. Corré `supabase/test_v2.sql` para comprobar las políticas (todo en una transacción con ROLLBACK; el último resultado dice `TODO OK`).
+
+**Orden:** corré `v2.sql` ANTES de publicar el front nuevo. Si se publica antes, las listas siguen andando (la app cae a las columnas de v1) pero las pantallas nuevas quedan vacías y no se cuentan los aportes. Los datos se traen paginados (1000 por pedido), así que el límite de filas de Supabase no recorta el historial.
