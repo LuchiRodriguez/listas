@@ -31,7 +31,7 @@ const MIMOS = {
   vale: { emoji: '🎁', name: 'Vale' },
 };
 const VALES = ['Vale por un masaje', 'Vale por unos mimos', 'Vale por unos besitos', 'Vale por un desayuno en la cama', 'Vale por elegir la peli', 'Vale por un chocolate'];
-const ROUTES = ['super', 'tareas', 'gastos', 'aportes', 'mimos', 'cierre'];
+const ROUTES = ['super', 'tareas', 'gastos', 'aportes', 'mimos', 'cierre', 'avisos'];
 const ACT_DAYS = 400;
 const MEMBER_COLS = 'user_id,name,color';
 const BUCKETS = [['hoy', 'Hoy'], ['semana', 'Semana'], ['algun_dia', 'Algún día']];
@@ -156,6 +156,15 @@ function friendlyAuthError(err) {
 
 /* ============================ Datos (Supabase) ========================== */
 
+/** Pide a la Edge Function 'notificar' que avise al otro. Fire-and-forget: nunca bloquea ni muestra errores. */
+function notificar(body) {
+  try {
+    Promise.resolve(state.client.functions.invoke('notificar', { body }))
+      .then((r) => { if (r?.error) console.warn('notificar', r.error.message); })
+      .catch((e) => console.warn('notificar', e?.message));
+  } catch (e) { console.warn('notificar', e?.message); }
+}
+
 async function loadMembers() {
   const { data, error } = await withTimeout(state.client.from('members').select(MEMBER_COLS));
   if (error) throw error;
@@ -248,6 +257,7 @@ async function insertItem(payload) {
   if (error) throw error;
   if (!state.items.some((i) => i.id === data.id)) state.items.push(data);
   render();
+  if (data.list === 'tareas' && data.assignee && data.assignee !== state.session?.user.id) notificar({ kind: 'tarea', id: data.id });
   return data;
 }
 
@@ -316,6 +326,7 @@ async function insertGasto(row) {
   if (error) throw error;
   if (!state.gastos.some((g) => g.id === data.id)) state.gastos.push(data);
   render();
+  notificar({ kind: 'gasto', id: data.id });
   return data;
 }
 
@@ -349,6 +360,7 @@ async function sendMimo(tipo, texto) {
   if (!state.mimos.some((m) => m.id === data.id)) state.mimos.unshift(data);
   state.seenMimos.add(data.id);
   render();
+  notificar({ kind: 'mimo', id: data.id });
   return data;
 }
 
@@ -511,6 +523,171 @@ async function saveCierre(key, manual) {
 }
 
 const cierreAreaFocused = () => document.activeElement instanceof HTMLElement && document.activeElement.classList.contains('cierre-area');
+
+/* ============================ Avisos push (v4) ============================ */
+
+// status: checking | unsupported | sw-error | ios-install | denied | off | on
+const push = { status: 'checking', busy: false, msg: '' };
+
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = () => navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const swReady = () => Promise.race([navigator.serviceWorker.ready, new Promise((res) => setTimeout(() => res(null), 5000))]);
+
+function urlB64ToBytes(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+function setPush(patch) {
+  const before = JSON.stringify(push);
+  Object.assign(push, patch);
+  if (JSON.stringify(push) !== before && state.phase === 'ready' && state.loaded) render();
+}
+
+/** Mira el estado real de este móvil (permiso + suscripción del navegador). */
+async function refreshPush() {
+  let next;
+  try {
+    if (isIOS() && !isStandalone()) next = 'ios-install';
+    else if (!pushSupported()) next = 'unsupported';
+    else if (Notification.permission === 'denied') next = 'denied';
+    else {
+      const reg = await swReady();
+      if (!reg) next = 'sw-error';
+      else {
+        const sub = Notification.permission === 'granted' ? await reg.pushManager.getSubscription() : null;
+        next = 'off';
+        if (sub) {
+          // "Activado" solo si la fila es de este usuario (RLS filtra): si otro usó este móvil, no lo está.
+          const { data } = await state.client.from('push_subs').select('id').eq('endpoint', sub.endpoint).limit(1);
+          if (data && data.length) next = 'on';
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('refreshPush', e?.message);
+    next = 'sw-error';
+  }
+  setPush({ status: next });
+}
+
+async function pushEnable() {
+  if (push.busy) return;
+  // requestPermission tiene que ser lo primero dentro del click (iOS exige el gesto): no poner nada antes.
+  const permP = Notification.requestPermission();
+  setPush({ busy: true, msg: '' });
+  let sub = null;
+  try {
+    const perm = await permP;
+    if (perm !== 'granted') { setPush({ busy: false, status: perm === 'denied' ? 'denied' : 'off', msg: perm === 'denied' ? '' : 'No diste el permiso. Si querés los avisos, tocá de nuevo y aceptá.' }); return; }
+    const reg = await swReady();
+    if (!reg) throw new Error('sin service worker');
+    sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToBytes(CFG.vapidPublicKey) });
+    const j = sub.toJSON();
+    const row = { endpoint: j.endpoint, p256dh: j.keys?.p256dh, auth: j.keys?.auth };
+    let { error } = await state.client.from('push_subs').insert(row);
+    if (error?.code === '23505') { // ese endpoint ya estaba: borrar la fila propia y reintentar una vez
+      await state.client.from('push_subs').delete().eq('endpoint', row.endpoint);
+      ({ error } = await state.client.from('push_subs').insert(row));
+      if (error?.code === '23505') { // el endpoint es de otra cuenta (mismo móvil, otra persona): sacar uno nuevo
+        await sub.unsubscribe();
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToBytes(CFG.vapidPublicKey) });
+        const j2 = sub.toJSON();
+        ({ error } = await state.client.from('push_subs').insert({ endpoint: j2.endpoint, p256dh: j2.keys?.p256dh, auth: j2.keys?.auth }));
+      }
+    }
+    if (error) throw error;
+    setPush({ busy: false, status: 'on', msg: '' });
+  } catch (e) {
+    console.warn('pushEnable', e?.message);
+    try { if (sub) await sub.unsubscribe(); } catch (e2) { /* ya está */ }
+    const denied = typeof Notification !== 'undefined' && Notification.permission === 'denied';
+    setPush({ busy: false, status: denied ? 'denied' : 'off', msg: denied ? '' : 'No se pudieron activar los avisos. Probá de nuevo en un rato; si sigue, avisale a quien mantiene la app.' });
+  }
+}
+
+async function pushDisable() {
+  if (push.busy) return;
+  setPush({ busy: true, msg: '' });
+  try {
+    const reg = await swReady();
+    if (!reg) throw new Error('sin service worker');
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      const { error } = await state.client.from('push_subs').delete().eq('endpoint', sub.endpoint);
+      if (error) throw error;
+      await sub.unsubscribe();
+    }
+    setPush({ busy: false, status: 'off', msg: 'Avisos desactivados en este móvil.' });
+  } catch (e) {
+    console.warn('pushDisable', e?.message);
+    setPush({ busy: false, msg: 'No se pudo desactivar. Probá de nuevo.' });
+  }
+}
+
+async function pushTest() {
+  if (push.busy) return;
+  setPush({ busy: true, msg: '' });
+  try {
+    const { data, error } = await state.client.functions.invoke('notificar', { body: { kind: 'prueba' } });
+    if (error) throw error;
+    let msg;
+    if (data?.sent > 0) msg = 'Listo, te mandamos un aviso. Tiene que llegar en unos segundos.';
+    else if (data?.motivo === 'ya enviado') msg = 'Ya te mandamos uno hace un momento. Esperá un minuto y probá de nuevo.';
+    else if (data?.failed > 0) msg = 'El envío falló. Probá de nuevo en un rato.';
+    else msg = 'No encontramos este móvil entre los suscriptos. Desactivá y volvé a activar los avisos.';
+    setPush({ busy: false, msg });
+  } catch (e) {
+    console.warn('pushTest', e?.message);
+    setPush({ busy: false, msg: 'No se pudo mandar la prueba. Esperá un minuto y probá de nuevo.' });
+  }
+}
+
+/** Línea para el inicio y mimos: solo si en este móvil los avisos se pueden activar y no lo están. */
+const pushInvite = () => push.status === 'off' || push.status === 'denied' || push.status === 'ios-install';
+
+function viewAvisos() {
+  const st = push.status;
+  const intro = h('p', { class: 'muted' }, 'Te avisamos con una vibración, aunque la app esté cerrada, cuando te llega un mimo o un vale, cuando el otro te asigna una tarea, cuando carga un gasto, y el sábado del último finde del mes para el cierre.');
+  let body;
+  if (st === 'checking') body = h('p', { class: 'muted' }, 'Mirando cómo está este móvil…');
+  else if (st === 'ios-install') {
+    body = h('div', { class: 'stack' },
+      h('p', null, 'En iPhone y iPad los avisos solo andan si abrís Listas desde el ícono de la pantalla de inicio (hace falta iOS 16.4 o más).'),
+      h('p', null, '1. Tocá Compartir → Agregar a pantalla de inicio.'),
+      h('p', null, '2. Abrí Listas desde ese ícono y volvé acá.'));
+  } else if (st === 'sw-error') {
+    body = h('div', { class: 'stack' },
+      h('p', null, 'No pudimos preparar los avisos en este móvil. Cerrá y abrí la app, y probá de nuevo.'),
+      h('button', { class: 'btn block', type: 'button', onclick: () => { setPush({ status: 'checking' }); registerSW(); refreshPush(); } }, 'Reintentar'));
+  } else if (st === 'unsupported') body = h('p', null, 'Este navegador no permite avisos. Probá desde Chrome o Safari (en iPhone, con la app en la pantalla de inicio).');
+  else if (st === 'denied') {
+    body = h('div', { class: 'stack' },
+      h('p', null, 'Los avisos están bloqueados para Listas en este móvil.'),
+      h('p', null, 'Habilitalos en Ajustes: en iPhone, Ajustes → Notificaciones → Listas; en Android, el candado de la barra del navegador → Permisos → Notificaciones. Después volvé acá.'));
+  } else if (st === 'on') {
+    body = h('div', { class: 'stack' },
+      h('div', { class: 'card-title' }, '✓ Avisos activados en este móvil'),
+      h('div', { class: 'row card-actions' },
+        h('button', { class: 'btn primary', type: 'button', disabled: push.busy, onclick: pushTest }, 'Probar aviso'),
+        h('button', { class: 'btn', type: 'button', disabled: push.busy, onclick: pushDisable }, 'Desactivar')));
+  } else {
+    body = h('button', { class: 'btn primary block', type: 'button', disabled: push.busy, onclick: pushEnable }, 'Activar avisos en este móvil');
+  }
+  return h('div', { class: 'stack' },
+    topbar('🔔 Avisos en este móvil'),
+    h('section', { class: 'card stack' }, intro, body, h('p', { class: 'muted small', role: 'status', 'aria-live': 'polite' }, push.msg)));
+}
+
+function registerSW() {
+  if (!('serviceWorker' in navigator) || window.top !== window.self) return;
+  try {
+    navigator.serviceWorker.register('./sw.js', { scope: './', updateViaCache: 'none' }).catch((e) => console.warn('sw', e?.message));
+  } catch (e) { console.warn('sw', e?.message); }
+}
 
 /* ============================== Tiempo real ============================= */
 
@@ -969,7 +1146,9 @@ function viewHome() {
         h('button', { class: 'btn ghost', type: 'button', onclick: signOut }, 'Salir')),
       liveLine()),
     mimoBanner(), mimosCard(), superCard, tasksCard, gastosCard(), weekCard(), cierreCard(),
-    h('a', { class: 'more-link soft', href: '#/cierre' }, 'Cierre del mes →'));
+    h('div', { class: 'foot-links' },
+      h('a', { class: 'more-link soft', href: '#/cierre' }, 'Cierre del mes →'),
+      h('a', { class: 'more-link soft', href: '#/avisos' }, '🔔 Avisos')));
 }
 
 function viewSuper() {
@@ -1320,6 +1499,7 @@ function viewMimos() {
 
   return h('div', { class: 'stack' },
     topbar('Mimos 💌'),
+    pushInvite() && h('a', { class: 'more-link', href: '#/avisos' }, 'Activá los avisos para enterarte aunque la app esté cerrada →'),
     h('section', { class: 'card' },
       h('div', { class: 'card-title' }, o ? `Mandale algo a ${o.name}` : 'Mandar un mimo'),
       mimoButtons(),
@@ -1605,7 +1785,7 @@ function parseRoute() {
   state.routeArg = state.route === 'cierre' && /^\d{4}-(0[1-9]|1[0-2])$/.test(b || '') ? b : null;
 }
 
-const VIEWS = { home: viewHome, super: viewSuper, tareas: viewTareas, gastos: viewGastos, aportes: viewAportes, mimos: viewMimos, cierre: viewCierre };
+const VIEWS = { home: viewHome, super: viewSuper, tareas: viewTareas, gastos: viewGastos, aportes: viewAportes, mimos: viewMimos, cierre: viewCierre, avisos: viewAvisos };
 
 function render() {
   const app = document.getElementById('app');
@@ -1666,6 +1846,7 @@ async function enterSession() {
     state.loaded = false; state.loadFailed = false;
     parseRoute();
     render();
+    refreshPush();
     await loadItems();
     if (gen !== enterGen) return;
     subscribe();
@@ -1679,6 +1860,17 @@ async function enterSession() {
 }
 
 async function signOut() {
+  // Que este móvil no siga recibiendo los avisos de quien sale (sin bloquear la salida).
+  try {
+    if (pushSupported() && state.session) {
+      const reg = await Promise.race([navigator.serviceWorker.getRegistration(), new Promise((res) => setTimeout(() => res(null), 2000))]);
+      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) {
+        await state.client.from('push_subs').delete().eq('endpoint', sub.endpoint);
+        await sub.unsubscribe();
+      }
+    }
+  } catch (e) { console.warn('signOut push', e?.message); }
   await state.client.auth.signOut();
 }
 
@@ -1748,11 +1940,14 @@ function boot() {
     if (prev && state.cierreDraft[prev]) saveCierre(prev); // no perder lo escrito al irse de la pantalla
     closeSheet(); parseRoute();
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur(); // si no, render() ignora el cambio con un textarea del cierre enfocado
-    state.freshMimos = new Set(); render(); window.scrollTo(0, 0);
+    state.freshMimos = new Set();
+    if (state.route === 'avisos') push.msg = '';
+    render(); window.scrollTo(0, 0);
+    if (state.route === 'avisos') refreshPush();
   });
   window.addEventListener('online', resync);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') resync();
+    if (document.visibilityState === 'visible') { resync(); if (state.route === 'avisos' && !push.busy) refreshPush(); }
     else if (state.route === 'cierre' && state.cierreDraft[cierreMes()]) saveCierre(cierreMes());
   });
   window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
@@ -1762,3 +1957,4 @@ function boot() {
 parseRoute();
 render();
 boot();
+registerSW();

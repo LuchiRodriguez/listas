@@ -356,3 +356,5 @@ label.q { font-size: 16px; font-weight: 700; color: var(--ink); display: flex; f
 .tabla tr.total th, .tabla tr.total td { font-weight: 800; border-top: 2px solid var(--line); }
 .casa-vacia { margin: 0; }
 .card-actions { align-items: center; }
+
+.foot-links { display: flex; justify-content: center; flex-wrap: wrap; column-gap: 20px; }
